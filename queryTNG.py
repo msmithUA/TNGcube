@@ -3,6 +3,7 @@ import os
 import numpy as np
 import h5py
 import pickle
+from TNGcube import Subhalo
 
 baseURL = 'http://www.tng-project.org/api/'
 headers = {"api-key": "b703779c1f099efed6f47b91607b1bb1"}
@@ -39,12 +40,12 @@ class QueryTNG():
         self.simName = simName
         self.snapNum = snapNum
     
-    def query_subhaloCat(self, mass_min=1e8, vmax_min=50., limit=10, pageID=0):
+    def query_subhaloCat(self, mass_range=[1e8, 1e15], vmax_range=[50., 1050.], limit=10, pageID=0):
         '''Query a catalog of available subhalo IDs whose masses and rotation curves are above the input thresholds. 
             Args:
-                mass_min : double [unit: Msun/h]
-                vmax_min : double [unit: km/s]
-                    query subhalos with vmax > vmax_min.
+                mass_range : [unit: Msun/h]
+                vmax_range : [unit: km/s]
+                    query subhalos within the given vmax range 
                     vmax is the maximum value of the spherically-averaged rotation curve
                 limit : int
                     number of subhalos to query for each pageID
@@ -56,11 +57,12 @@ class QueryTNG():
                 suhaloIDs : list
                     a list of suhaloIDs satisfying the query condition.
         '''
-        mass_min_1e10Msun_h = mass_min/1e10*self.h  # mass_min_1e10Msun_h [unit: 1e10 Msun/h]
-
-        search_query = f'?limit={limit}&offset={int(pageID*limit)}&mass__gt={mass_min_1e10Msun_h}&vmax__gt={vmax_min}'
+        mass_range = np.array(mass_range)/1e10*self.h  # change unit to [unit: 1e10 Msun/h]
+  
+        search_query = f'?limit={limit}&offset={int(pageID*limit)}&mass__gt={mass_range[0]}&mass__lt={mass_range[1]}&vmax__gt={vmax_range[0]}&vmax__lt={vmax_range[1]}'
 
         searchurl = self.subhalosURL + search_query
+        print('search url:', searchurl)
         self.subhaloCat = get(searchurl)
         subhaloIDs = [self.subhaloCat['results'][i]['id'] for i in range(limit)]
         return subhaloIDs
@@ -79,7 +81,7 @@ class QueryTNG():
         _xyz = ['_x', '_y', '_z']
 
         for key in key_vec:
-            subhaloInfo[key] = [subhaloInfo_all[key+i] for i in _xyz]
+            subhaloInfo[key] = np.array([subhaloInfo_all[key+i] for i in _xyz])
 
         return subhaloInfo
     
@@ -131,7 +133,7 @@ class QueryTNG():
                     subhaloInfo = pickle.load(open('cutout_46.pkl', 'rb'))
         '''
 
-        subhaloInfos = {}
+        catalog = {}
         for ID in subhaloIDs:
             subhaloInfo = self.query_subhaloInfo(ID)
             fhdf5_cutout = self.load_subhaloCutout(ID)
@@ -140,15 +142,17 @@ class QueryTNG():
                 snapInfo = {    'gas' :  self._preprocess_snap_arrs(f_hdf5, 'PartType0', subhaloInfo),
                                 'stars' : self._preprocess_snap_arrs(f_hdf5, 'PartType4', subhaloInfo)  }
 
-            subhaloInfo['snapInfo'] = snapInfo
+            subhalo = Subhalo(info=subhaloInfo, snap=snapInfo)
 
             os.remove(fhdf5_cutout)
-            fpkl_cutout = f'cutout_{ID}.pkl'
-            pickle.dump(subhaloInfo, open(fpkl_cutout, 'wb'))
-            subhaloInfos[ID] = subhaloInfo
+            fpkl_cutout = f'subhalo_{ID}.pkl'
+            pickle.dump(subhalo, open(fpkl_cutout, 'wb'))
+            catalog[ID] = subhalo
 
-        return subhaloInfos
+        return catalog
     
+
+
 
 
 def get(path, params=None):
