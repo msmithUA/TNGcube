@@ -121,7 +121,10 @@ class QueryTNG():
         for j in range(3):
             snap['pos'][:, j] -= subhaloInfo['cm'][j]
             snap['vel'][:, j] -= subhaloInfo['vel'][j]
-
+        
+        # coordinate re-adjustment on subhaloInfo (w.r.t. the subhalo c.m. and system velocity)
+        # note that this is not implemented yet.
+        
         return snap
     
     def download_subhalos(self, subhaloIDs):

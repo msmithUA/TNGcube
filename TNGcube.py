@@ -34,8 +34,8 @@ class ParametersTNG:
             for key in par_in.keys():
                 self.fid[key] = par_in[key]
         
-        self.define_grids(pars=self.fid)
         self.add_cosmoRedshift(redshift=self.fid['redshift'])
+        self.define_grids(pars=self.fid)
 
     def _init_pars(self):
         '''Initiate default parameters'''
@@ -44,6 +44,7 @@ class ParametersTNG:
         pars0['redshift'] = 0.4
         pars0['sini'] = 0.5
         pars0['theta_int'] = 0.
+        pars0['aspect'] = 0.2
 
         pars0['spinR'] = [0., 0., -1.]
         pars0['g1'] = 0.
@@ -149,8 +150,8 @@ class Subhalo:
                     total rotation operator : R = R_pa@R_sini@R_spin
         '''
         
-        for key in ['cm', 'pos', 'spin', 'vel']:
-            self.info[key] = self.vec3Dtransform(M=R, vec=self.info[key])
+        #for key in ['cm', 'pos', 'spin', 'vel']:
+        #    self.info[key] = self.vec3Dtransform(M=R, vec=self.info[key])
 
         for ptlType in ['gas', 'stars']:
             for key in ['pos', 'vel']:
@@ -162,12 +163,22 @@ class Subhalo:
         '''
         L = np.array([[1.+g1, g2, 0.],[g2, 1.-g1, 0.], [0., 0., 1.]])
         
-        for key in ['cm', 'pos', 'spin', 'vel']:
-            self.info[key]=self.vec3Dtransform(M=L, vec=self.info[key])
+        #for key in ['cm', 'pos', 'spin', 'vel']:
+        #    self.info[key]=self.vec3Dtransform(M=L, vec=self.info[key])
 
         for ptlType in ['gas', 'stars']:
             for key in ['pos', 'vel']:
                 self.snap[ptlType][key]=self.vec3Dtransform(M=L, vec=self.snap[ptlType][key])
+
+    def recenter(self, dx):
+        '''Minor position adjust to make the center of the subhalo more closer to [0, 0, 0].
+            Args:
+                dx: e.g [0.1, 0.1, 0.]
+        '''
+        for ptlType in ['gas', 'stars']:
+            for j in range(3):
+                self.snap[ptlType]['pos'][:, j] += dx[j]
+
     
 
 
@@ -181,7 +192,6 @@ class TNGmock:
             self.Pars = pars
         else:
             raise TypeError("Argument, pars, needs to be a dictionary or an instance of the ParametersTNG class.")
-
 
         self.subhalo = subhalo
         self._init_constants()
@@ -338,19 +348,85 @@ class TNGmock:
 
         return specCube
     
-    def add_sky_noise(self, specCube):
-        
-        self.sky = Sky(self.Pars)
+    def add_sky_noise(self, specCube, sky):
 
         for k in range(self.Pars.lambdaGrid.size):
             thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.gridPixScale)
-            noise = galsim.CCDNoise(sky_level = self.sky.spec1D[k], read_noise = self.Pars.fid['read_noise'])
+            noise = galsim.CCDNoise(sky_level = sky.spec1D[k], read_noise = self.Pars.fid['read_noise'])
             noiseImage = thisIm.copy()
             noiseImage.addNoise(noise)
 
             specCube.array[:, :, k] = noiseImage.array
         
         return specCube
+    
+    def gen_mock_data(self, noise_mode=0):
+        '''generate mock data_info dict.
+            noise_mode = 1 : return noise data
+            noise_mode = 0 : return noiseless data
+        '''
+        # 1. compute total rotation matrix, Rtot
+        R_spin = self.spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.fid['spinR'])
+        R_sini = self.sini_rotation(sini=self.Pars.fid['sini'])
+        R_pa = self.PA_rotation(theta_int=self.Pars.fid['theta_int'])
+
+        Rtot = R_pa@R_sini@R_spin
+
+        # 2. Perform rotation and add shear to subhalo
+        self.subhalo.rotation(Rtot)
+        self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
+
+        # 3. generate specCube
+        massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, subhalo=self.subhalo)
+
+        self.specCube = self.mass_to_light(massCube)
+        self.specCube.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+
+        self.specCube = self.flux_renorm(self.specCube)
+
+        # 4. compute sky noise
+        self.sky = Sky(self.Pars)
+
+        # add sky noise to specCube if noise_mode is 1.
+        if noise_mode == 1:
+            self.specCube = self.add_sky_noise(self.specCube, self.sky)
+        
+        # 4.1 adjust the cutout range of the specCube
+        Nk = len(self.specCube.lambdaGrid)
+        nout = 20
+        self.specCube = self.specCube.cutout(xlim=[-4.0, 4.0], id_LOS=list(range(nout,Nk-nout)))
+
+        # 5. compute photometry
+        self.image = Image(self.specCube)
+
+        # 6. compute slit spectra
+        SlitObj = SlitSpec(self.specCube, slitWidth=self.Pars.fid['slitWidth'])
+        spectra = SlitObj.get_spectra(slitAngles=self.Pars.fid['slitAngles'])
+
+
+        data_info = {   'spec_variance': self.sky.spec2D, 
+                        'image_variance': self.image.gen_image_variance(signal_to_noise=100),
+                        'par_fid': self.Pars.fid,
+                        'flux_norm': np.sum(self.image.array),
+                        'line_species': self.line_species[0]    }
+        
+        data_info['spec'] = spectra
+        data_info['image'] = self.image.array
+
+        data_info['par_fid']['vcirc'] = self.subhalo.info['vmax']
+        data_info['par_fid']['r_hl_image'] = 0.5
+        data_info['par_fid']['vscale'] = 0.5
+        data_info['par_fid']['r_0'] = 0.0
+        data_info['par_fid']['v_0'] = 0.0
+        data_info['par_fid']['flux'] = data_info['flux_norm']
+        data_info['par_fid']['subGridPixScale'] = self.specCube.gridPixScale
+        data_info['par_fid']['ngrid'] = self.image.ngrid
+        data_info['lambdaGrid'] = self.specCube.lambdaGrid
+        data_info['spaceGrid'] = self.specCube.spaceGrid
+        data_info['lambda_emit'] = self.Pars.lineLambda0[self.line_species[0]]
+
+
+        return data_info
 
 
 class Sky:
@@ -393,9 +469,64 @@ class Sky:
         return slitObj.get_spectra(slitAngles=[0.])[0]
 
         
+class Image:
+    '''The image data class
+        Ways to construct an Image:
+        > Image(array, spaceGrid)
+        > Image(SpecCube)
+    '''
+    def __init__(self, *args, **kwargs):
+
+        if len(args) == 1:
+            if isinstance(args[0], SpecCube):
+                self.array = np.sum(args[0].array, axis=2)
+                self.spaceGrid = args[0].spaceGrid
+            else:
+                raise TypeError('Input arguemnt needs to be a SpecCube obj (if only 1 argument is passed).')
+        elif len(args) == 2:
+            if isinstance(args[0], np.ndarray) and isinstance(args[1], np.ndarray):
+                self.array = args[0]
+                self.spaceGrid = args[1]
+            else:
+                raise TypeError('Input arguemnts need to be a 2D and a 1D np.array(when 2 arguments are passed).')
     
+    @property
+    def gridPixScale(self):
+        return self.spaceGrid[2]-self.spaceGrid[1]
 
+    @property
+    def ngrid(self):
+        return len(self.spaceGrid)
+    
+    def cutout(self, xlim=[-2.5, 2.5]):
+        '''return a smaller subImage given the xlim range'''
+        id_x = np.where((self.spaceGrid >= xlim[0]) & (self.spaceGrid <= xlim[1]))[0]
 
+        return Image(self.array[id_x, :][:, id_x], self.spaceGrid[id_x])
+    
+    def rebin(self, shape, operation='sum'):
+        '''rebin self.array into the given shape'''
+        if not operation in ['sum', 'mean']:
+            raise ValueError("Operation not supported.")
+        
+        sh = shape[0], self.array.shape[0]//shape[0], shape[1], self.array.shape[1]//shape[1]
+
+        if operation == 'sum':
+            new_image = self.array.reshape(sh).sum(3).sum(1)
+        else:
+            new_image = self.array.reshape(sh).mean(3).mean(1)
+        
+        new_spaceGrid = self.spaceGrid.reshape(sh[0], sh[1]).mean(1)
+
+        return Image(new_image, new_spaceGrid)
+    
+    def gen_image_variance(self, signal_to_noise):
+        
+        gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.gridPixScale)
+
+        variance = gsImg.addNoiseSNR(galsim.GaussianNoise(), signal_to_noise, preserve_flux=True)
+
+        return variance
 
 
 class SlitSpec:
@@ -521,14 +652,16 @@ class SpecCube:
         sh = []
         for i in range(3):
             sh += [shape[i], self.array.shape[i]//shape[i]]
+        
+        #print(sh)
 
         if operation == 'sum':
             new_dataCube = self.array.reshape(sh).sum(5).sum(3).sum(1)
         else:
             new_dataCube = self.array.reshape(sh).mean(5).mean(3).mean(1)
         
-        new_spaceGrid = self.spaceGrid.reshape(sh[0], self.array.shape[0]//shape[0]).mean(1)
-        new_lambdaGrid = self.lambdaGrid.reshape(sh[2], self.array.shape[2]//shape[2]).mean(1)
+        new_spaceGrid = self.spaceGrid.reshape(sh[0], sh[1]).mean(1)
+        new_lambdaGrid = self.lambdaGrid.reshape(sh[4], sh[5]).mean(1)
 
         return SpecCube(new_dataCube, new_spaceGrid, new_lambdaGrid)
     
@@ -566,3 +699,4 @@ class SpecCube:
         for i, x in enumerate(self.spaceGrid):
             for j, y in enumerate(self.spaceGrid):
                 self.array[j, i, :] = self._smooth_spec11D(spec1D=self.array[j, i, :], sigma2Grid=sigma2Grid)
+
