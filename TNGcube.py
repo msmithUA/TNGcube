@@ -1,6 +1,5 @@
 import numpy as np
 import pickle
-from rotations.rotations3d import rotation_matrices_from_vectors
 import sys
 import pathlib
 import galsim
@@ -9,6 +8,8 @@ dir_KLens = dir_repo + '/KLens'
 sys.path.append(dir_KLens)
 
 from tfCube2 import gen_grid
+
+from utils import spin_rotation, sini_rotation, PA_rotation
 
 from astropy.cosmology import Planck15 as cosmo
 import astropy.units as u
@@ -170,21 +171,32 @@ class Subhalo:
             for key in ['pos', 'vel']:
                 self.snap[ptlType][key]=self.vec3Dtransform(M=L, vec=self.snap[ptlType][key])
 
-    def recenter(self, dx):
+    def recenter_pos(self, dx):
         '''Minor position adjust to make the center of the subhalo more closer to [0, 0, 0].
             Args:
-                dx: e.g [0.1, 0.1, 0.]
+                dx: [unit: ckpc/h]
+                    e.g [0.1, 0.1, 0.]
         '''
         for ptlType in ['gas', 'stars']:
             for j in range(3):
                 self.snap[ptlType]['pos'][:, j] += dx[j]
+    
+    def recenter_vel(self, dv):
+        '''Minor velocity adjust to make the center of the subhalo more closer to [0, 0, 0].
+            Args:
+                dv: [unit: km/s]
+                    e.g [0., 0., 0.5]
+        '''
+        for ptlType in ['gas', 'stars']:
+            for j in range(3):
+                self.snap[ptlType]['vel'][:, j] += dv[j]
 
     
 
 
 class TNGmock:
 
-    def __init__(self, pars, subhalo):
+    def __init__(self, pars, subhalo, par_meta=None):
 
         if isinstance(pars, dict):
             self.Pars = ParametersTNG(par_in=pars)
@@ -192,6 +204,9 @@ class TNGmock:
             self.Pars = pars
         else:
             raise TypeError("Argument, pars, needs to be a dictionary or an instance of the ParametersTNG class.")
+        
+        if par_meta is not None:
+            self.par_meta = par_meta
 
         self.subhalo = subhalo
         self._init_constants()
@@ -210,46 +225,7 @@ class TNGmock:
         
         line_species = [key for key, val in filter(lambda item: is_between(item[1]), self.Pars.lineLambdaC.items())]
 
-        return line_species
-
-    def spin_rotation(self, spin0, spinR=[0.,0., -1.]):
-        '''Spin Rotation Operator
-            Compute the rotation matrix R_spin such that after applying R_spin on patricles, the new spin vector is aligned with the targeted spin direction.
-            Args:
-                spin0: [spin_x, spin_y, spin_z]
-                    the original spin axis vector
-                spinR: default = [0., 0., -1.]
-                    targeted spin dirction after applying the rotation operator
-            Return:
-                R_spin: Rotation matrix to aling spin0 to spinR.
-        '''
-        R_spin = rotation_matrices_from_vectors(spin0, spinR)[0]
-        return R_spin
-    
-    def sini_rotation(self, sini):
-        '''Inclination Operator
-            Args:
-                sini: real
-                    sin(inclination angle)
-            Returns: 
-                R_sini: Rotation matrix along the x-axis to incline a face-on disk defined in the x-y plane.
-        '''
-        cosi = np.sqrt(1.-sini**2)
-        R_sini = np.array([[1., 0., 0.], [0., cosi, -sini], [0., sini, cosi]])
-        return R_sini
-    
-    def PA_rotation(self, theta_int):
-        '''Position angle Operator
-                theta_int: real [unit: radian]
-                    P.A. of a disk
-            Returns:
-                R_pa: Rotation matrix to rotate a disk along the z-axis by theta_int.
-        '''
-        sina = np.sin(theta_int)
-        cosa = np.cos(theta_int)
-        R_pa = np.array([[cosa, -sina, 0.],[sina, cosa, 0.],[0., 0., 1.]])
-
-        return R_pa    
+        return line_species   
   
     def vLOS_to_lambda(self, v_z, lineType):
         '''computed the redshifted lambda given v_z
@@ -366,14 +342,26 @@ class TNGmock:
             noise_mode = 0 : return noiseless data
         '''
         # 1. compute total rotation matrix, Rtot
-        R_spin = self.spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.fid['spinR'])
-        R_sini = self.sini_rotation(sini=self.Pars.fid['sini'])
-        R_pa = self.PA_rotation(theta_int=self.Pars.fid['theta_int'])
+        R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.fid['spinR'])
+        R_sini = sini_rotation(sini=self.Pars.fid['sini'])
+        R_pa = PA_rotation(theta=self.Pars.fid['theta_int'])
 
         Rtot = R_pa@R_sini@R_spin
 
-        # 2. Perform rotation and add shear to subhalo
+        # 2.0 Perform rotation to subhalo
         self.subhalo.rotation(Rtot)
+
+        # 2.1 Perform additional adjustment to subhalo (if par_meta is set)
+        if self.par_meta is not None:
+            if self.par_meta['theta'] is not None:
+                Rth = PA_rotation(theta=self.par_meta['theta'])
+                self.subhalo.rotation(Rth)
+            if self.par_meta['dx'] is not None:
+                self.subhalo.recenter_pos(dx=self.par_meta['dx'])
+            if self.par_meta['dv'] is not None:
+                self.subhalo.recenter_vel(dv=self.par_meta['dv'])
+
+        # 2.2 add Shear to subhalo
         self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
 
         # 3. generate specCube
