@@ -316,8 +316,7 @@ class TNGmock:
     def flux_renorm(self, specCube):
         '''Perform flux re-normalization for photonCube such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars.fid['ref_SDSS_peakI']*expTime*area
         '''
-        fiberObj = FiberSpec(specCube)
-        spec1D = fiberObj.get_spectrum(fiberR=1.5)  # SDSS fiber Radius=1.5 arcsec
+        spec1D = Fiber(specCube).get_spectrum(fiberR=1.5)  # SDSS fiber Radius=1.5 arcsec
         Nphoton_peak = spec1D.max()*u.photon/u.nm
         renorm_factor = self.Pars.int_SDSS_peakI/Nphoton_peak
         specCube.array *= renorm_factor.value
@@ -380,16 +379,16 @@ class TNGmock:
             self.specCube = self.add_sky_noise(self.specCube, self.sky)
         
         # 4.1 adjust the cutout range of the specCube
-        Nk = len(self.specCube.lambdaGrid)
-        nout = 20
-        self.specCube = self.specCube.cutout(xlim=[-4.0, 4.0], id_LOS=list(range(nout,Nk-nout)))
+        #Nk = len(self.specCube.lambdaGrid)
+        #nout = 20
+        #self.specCube0 = self.specCube
+        #self.specCube = self.specCube.cutout(xlim=[-4.0, 4.0], id_LOS=list(range(nout,Nk-nout)))
 
         # 5. compute photometry
         self.image = Image(self.specCube)
 
         # 6. compute slit spectra
-        SlitObj = SlitSpec(self.specCube, slitWidth=self.Pars.fid['slitWidth'])
-        spectra = SlitObj.get_spectra(slitAngles=self.Pars.fid['slitAngles'])
+        spectra = Slit(self.specCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=self.Pars.fid['slitAngles'])
 
 
         data_info = {   'spec_variance': self.sky.spec2D, 
@@ -453,14 +452,14 @@ class Sky:
     
     @property
     def spec2D(self):
-        slitObj = SlitSpec(self.skyCube, slitWidth=self.Pars.fid['slitWidth'])
-        return slitObj.get_spectra(slitAngles=[0.])[0]
+        spec = Slit(self.skyCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=[0.])[0]
+        return spec
 
         
 class Image:
     '''The image data class
         Ways to construct an Image:
-        > Image(array, spaceGrid)
+        > Image(array2D, spaceGrid)
         > Image(SpecCube)
     '''
     def __init__(self, *args, **kwargs):
@@ -476,7 +475,7 @@ class Image:
                 self.array = args[0]
                 self.spaceGrid = args[1]
             else:
-                raise TypeError('Input arguemnts need to be a 2D and a 1D np.array(when 2 arguments are passed).')
+                raise TypeError('Input arguemnts need to be a 2D and a 1D np.array (when 2 arguments are passed).')
     
     @property
     def gridPixScale(self):
@@ -517,46 +516,46 @@ class Image:
         return variance
 
 
-class SlitSpec:
+class Slit:
     def __init__(self, specCube, slitWidth):
 
         self.specCube = specCube
-        self.slit_weight = self.weight_mask(slitWidth=slitWidth)
+        self.slit_mask = self.gen_mask(slitWidth=slitWidth)
 
-    def weight_mask(self, slitWidth):
+    def gen_mask(self, slitWidth):
 
-        ngrid = len(self.specCube.spaceGrid)
+        ngrid = self.specCube.ngrid
         X, Y = np.meshgrid(self.specCube.spaceGrid, self.specCube.spaceGrid)
-        weight = np.ones((ngrid, ngrid))
-        weight[np.abs(Y) > slitWidth/2.] = 0.
+        mask = np.ones((ngrid, ngrid))
+        mask[np.abs(Y) > slitWidth/2.] = 0.
 
-        return weight
+        return mask
 
     def get_spectra(self, slitAngles):
         spectra = []
 
         for this_slit_angle in slitAngles:
             this_data = rotate(self.specCube.array, this_slit_angle * (180./np.pi), reshape=False)
-            spectra.append(np.sum(this_data*self.slit_weight[:, :, np.newaxis], axis=0))
+            spectra.append(np.sum(this_data*self.slit_mask[:, :, np.newaxis], axis=0))
 
         return spectra
 
 
-class FiberSpec:
+class Fiber:
     def __init__(self, specCube):
 
         self.specCube = specCube
-        self.ngrid = len(self.specCube.spaceGrid)
+        self.ngrid = specCube.ngrid
         X, Y = np.meshgrid(self.specCube.spaceGrid, self.specCube.spaceGrid)
         self.R = np.sqrt(X**2+Y**2)
 
-    def weight_mask(self, fiberR):
+    def gen_mask(self, fiberR):
 
-        weight = np.ones((self.ngrid, self.ngrid))
+        mask = np.ones((self.ngrid, self.ngrid))
         ID_out_R = np.where(self.R > fiberR)
-        weight[ID_out_R] = 0.0
+        mask[ID_out_R] = 0.0
 
-        return weight
+        return mask
 
     def get_spectrum(self, fiberR, expTime=None, area=None):
         '''
@@ -564,23 +563,27 @@ class FiberSpec:
                 fiberR : fiber radius [unit: arcsec]
         '''
 
-        weight = self.weight_mask(fiberR)
-        weightCube = np.repeat(weight[:, :, np.newaxis], self.specCube.array.shape[2], axis=2)
-        spectrum = np.sum(np.sum(self.specCube.array*weightCube, axis=0), axis=0)
+        mask = self.gen_mask(fiberR)
+        maskCube = np.repeat(mask[:, :, np.newaxis], self.specCube.array.shape[2], axis=2)
+        spectrum = np.sum(np.sum(self.specCube.array*maskCube, axis=0), axis=0)
 
         if (expTime is not None) and (area is not None):
             # if both expTime and telescope area information is given, 
             # return spectrum in the default unit of SDSS
-            return self._specPhoton_2_specSDSS(spectrum, expTime, area) # [unit: u.erg/u.Angstrom/u.s/u.cm**2]
+            return Fiber.specPhoton_2_specSDSS(spectrum, expTime, area) # [unit: u.erg/u.Angstrom/u.s/u.cm**2]
         else:
             return spectrum  # [unit: u.photon/u.nm]
     
-    def _specPhoton_2_specSDSS(self, specPhoton, expTime, area):
-        '''
+    @staticmethod
+    def specPhoton_2_specSDSS(specPhoton, expTime, area):
+        '''Perform unit transformation for a input spec1D [photons/nm] to the standard SDSS fiber spec unit [erg/Angstrom/s/cm^2], given the expTime, and telecscope area.
+
             Args:
                 specPhoton : 1D array, spectrum in unit: photons/nm
                 expTime: real, unit: sec
                 area: real, telescope area, unit: cm2
+            Returns:
+                specSDSS : 1D array, spectrum in unit [erg/Angstrom/s/cm^2]
         '''
         specSDSS = (specPhoton*u.photon/u.nm)/(expTime*u.second)/(area*u.cm**2)
 
@@ -593,8 +596,8 @@ class FiberSpec:
 
 
 class SpecCube:
-    def __init__(self, array, spaceGrid, lambdaGrid):
-        self.array = array
+    def __init__(self, array3D, spaceGrid, lambdaGrid):
+        self.array = array3D
         self.spaceGrid = spaceGrid
         self.lambdaGrid = lambdaGrid
     
