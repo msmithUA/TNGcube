@@ -16,6 +16,7 @@ import astropy.units as u
 from astropy import constants
 from astropy.io import fits
 from scipy.ndimage.interpolation import rotate
+from matplotlib import pyplot as plt
 
 
 class ParametersTNG:
@@ -326,7 +327,7 @@ class TNGmock:
     def add_sky_noise(self, specCube, sky):
 
         for k in range(self.Pars.lambdaGrid.size):
-            thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.gridPixScale)
+            thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.pixScale)
             noise = galsim.CCDNoise(sky_level = sky.spec1D[k], read_noise = self.Pars.fid['read_noise'])
             noiseImage = thisIm.copy()
             noiseImage.addNoise(noise)
@@ -406,7 +407,7 @@ class TNGmock:
         data_info['par_fid']['r_0'] = 0.0
         data_info['par_fid']['v_0'] = 0.0
         data_info['par_fid']['flux'] = data_info['flux_norm']
-        data_info['par_fid']['subGridPixScale'] = self.specCube.gridPixScale
+        data_info['par_fid']['subGridPixScale'] = self.specCube.pixScale
         data_info['par_fid']['ngrid'] = self.image.ngrid
         data_info['lambdaGrid'] = self.specCube.lambdaGrid
         data_info['spaceGrid'] = self.specCube.spaceGrid
@@ -476,9 +477,12 @@ class Image:
                 self.spaceGrid = args[1]
             else:
                 raise TypeError('Input arguemnts need to be a 2D and a 1D np.array (when 2 arguments are passed).')
+        
+        if 'array_var' in kwargs:
+            self.array_var = kwargs.pop('array_var')
     
     @property
-    def gridPixScale(self):
+    def pixScale(self):
         return self.spaceGrid[2]-self.spaceGrid[1]
 
     @property
@@ -509,11 +513,69 @@ class Image:
     
     def gen_image_variance(self, signal_to_noise):
         
-        gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.gridPixScale)
+        gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.pixScale)
 
         variance = gsImg.addNoiseSNR(galsim.GaussianNoise(), signal_to_noise, preserve_flux=True)
 
         return variance
+    
+    def _get_mesh(self, mode='corner'):
+        '''generate coordiante mesh
+            Args: 
+                mode: 'corner' or 'center'
+                    corner mode: mesh coordinate refers to the bottom left corner of each pixel grid
+                    center mode: mesh coordinate refers to the center of each pixel grid
+        '''
+        if mode == 'corner':
+            spaceGrid_plt = self.spaceGrid - self.pixScale/2.
+            Xmesh, Ymesh = np.meshgrid(spaceGrid_plt, spaceGrid_plt)
+        else:
+            Xmesh, Ymesh = np.meshgrid(self.spaceGrid, self.spaceGrid)
+        return Xmesh, Ymesh
+    
+    def display(self, xlim=None, filename=None, title='image', mark_cen=True, model=None):
+        '''display the 2D image array'''
+
+        fig, ax = plt.subplots(1, 1, figsize=(4.5, 4.))
+        plt.rc('font', size=14)
+
+        if model is None:
+            Xmesh, Ymesh = self._get_mesh(mode='corner')
+            gal = ax.pcolormesh(Xmesh, Ymesh, self.array)
+        else:
+            Xmesh, Ymesh = self._get_mesh(mode='center')
+            gal = ax.contourf(Xmesh, Ymesh, self.array)
+            mod = ax.contour(Xmesh, Ymesh, model, levels=gal.levels, colors='yellow')
+            ax.clabel(mod, inline=1, fontsize=10)
+        
+        if mark_cen:
+            ax.axvline(x=0., ls='--', color='lightgray', alpha=0.7)
+            ax.axhline(y=0., ls='--', color='lightgray', alpha=0.7)
+
+        ax.set_xlabel('x [arcsec]', fontsize=14)
+        ax.set_ylabel('y [arcsec]', fontsize=14)
+        ax.tick_params(labelsize=14)
+
+        ax.set_title(title, fontsize=14)
+
+        cbr = fig.colorbar(gal, ax=ax)
+        cbr.ax.tick_params(labelsize=13)
+
+        if xlim is not None:
+            ax.set_xlim((xlim[0], xlim[1]))
+            ax.set_ylim((xlim[0], xlim[1]))
+        else:
+            ax.set_xlim((self.spaceGrid.min(), self.spaceGrid.max()))
+            ax.set_ylim((self.spaceGrid.min(), self.spaceGrid.max()))
+        
+        if filename is not None:
+            fig.savefig(filename, bbox_inches='tight')
+        else:
+            fig.tight_layout()
+            fig.show()
+        
+        return fig, ax
+
 
 
 class Slit:
@@ -602,7 +664,7 @@ class SpecCube:
         self.lambdaGrid = lambdaGrid
     
     @property
-    def gridPixScale(self):
+    def pixScale(self):
         return self.spaceGrid[2]-self.spaceGrid[1]
     
     @property
@@ -661,10 +723,10 @@ class SpecCube:
         psf = psf.shear(g1=psf_g1, g2=psf_g2)
 
         for k in self.id_LOSwithEmitssion:
-            thisIm = galsim.Image(np.ascontiguousarray(self.array[:,:,k]), scale=self.gridPixScale)
+            thisIm = galsim.Image(np.ascontiguousarray(self.array[:,:,k]), scale=self.pixScale)
             galobj = galsim.InterpolatedImage(image=thisIm)
             galC = galsim.Convolution([galobj, psf])
-            newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.gridPixScale))
+            newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale))
             self.array[:,:,k] = newImage.array
 
     def kernel_at_k(self, k, sigma2Grid):
