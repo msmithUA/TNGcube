@@ -68,6 +68,7 @@ class QueryTNG():
         return subhaloIDs
 
     def query_subhaloInfo(self, subhaloID):
+        '''query the overall properties of the subhalo, given subhaloID'''
 
         subhaloURL = self.subhalosURL + f'{int(subhaloID)}/'
 
@@ -85,13 +86,13 @@ class QueryTNG():
 
         return subhaloInfo
     
-    def load_subhaloCutout(self, subhaloID):
+    def query_subhaloCutout(self, subhaloID):
         '''Download the snapshot particle information in the given subhalo field.
             Output file: 
                 e.g. if subhaloID=46, output a file at './cutout_46.hdf5'
         '''
 
-        cutout_request = {'gas'  :'Coordinates,Masses,Velocities', \
+        cutout_request = {'gas': 'Coordinates,Masses,Velocities,StarFormationRate,InternalEnergy',
                           'stars': 'Coordinates,Masses,Velocities'} 
                         # 'dm'   :'Coordinates,Velocities'
 
@@ -101,7 +102,9 @@ class QueryTNG():
         return fname_cutout
     
     def _preprocess_snap_arrs(self, f_hdf5, ptl_type, subhaloInfo):
-        '''
+        ''' 
+            Args:
+                ptl_type : 'PartType0' (for gas) or 'PartType4' (for stars)
             Returns:
                 snap['pos']  : ndarray Nptlx3 [unit: ckpc/h]
                     particle position w.r.t. the subhalo central of mass coordinate
@@ -110,6 +113,13 @@ class QueryTNG():
                 snap['vel']  : ndarray Nptlx3 [unit: km/s]
                     particle velocities w.r.t. the overall systematic velocity of the subhalo
                     (Note: the sqrt(a) factor in the original unit is taken away after processing.)
+                snap['SFR']  : 1d array     [unit: Msun/yr]
+                    Instantaneous star formation rate of this gas cell.
+                snap['InternalEnergy'] : 1d array  [unit: (km/s)^2] (only available for gas ptl.)
+                    Internal (thermal) energy per unit mass for this gas cell.
+            
+            Reference: 
+                https://www.tng-project.org/data/docs/specifications/
         '''
 
         snap = {    'pos': f_hdf5[ptl_type]['Coordinates'][:, :], 
@@ -121,6 +131,10 @@ class QueryTNG():
         for j in range(3):
             snap['pos'][:, j] -= subhaloInfo['cm'][j]
             snap['vel'][:, j] -= subhaloInfo['vel'][j]
+        
+        if ptl_type == 'PartType0':
+            snap['InternalEnergy'] = f_hdf5[ptl_type]['InternalEnergy'][:]
+            snap['SFR'] = f_hdf5[ptl_type]['StarFormationRate'][:]
         
         # coordinate re-adjustment on subhaloInfo (w.r.t. the subhalo c.m. and system velocity)
         # note that this is not implemented yet.
@@ -139,7 +153,7 @@ class QueryTNG():
         catalog = {}
         for ID in subhaloIDs:
             subhaloInfo = self.query_subhaloInfo(ID)
-            fhdf5_cutout = self.load_subhaloCutout(ID)
+            fhdf5_cutout = self.query_subhaloCutout(ID)
             
             with h5py.File(fhdf5_cutout, 'r') as f_hdf5:
                 snapInfo = {    'gas' :  self._preprocess_snap_arrs(f_hdf5, 'PartType0', subhaloInfo),

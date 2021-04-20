@@ -5,7 +5,9 @@ import pathlib
 import galsim
 dir_repo = str(pathlib.Path(__file__).parent.absolute())+'/..'
 dir_KLens = dir_repo + '/KLens'
+dir_binnedFit = dir_repo + '/BinnedFit'
 sys.path.append(dir_KLens)
+sys.path.append(dir_binnedFit)
 
 from tfCube2 import gen_grid
 
@@ -16,8 +18,10 @@ import astropy.units as u
 from astropy import constants
 from astropy.io import fits
 from scipy.ndimage.interpolation import rotate
+from scipy.ndimage import gaussian_filter1d
 from matplotlib import pyplot as plt
 
+from spec2D import Spec2D
 
 class ParametersTNG:
     lineLambda0 = {'OIIa': 372.7092, 'OIIb': 372.9875,
@@ -62,6 +66,7 @@ class ParametersTNG:
         pars0['lambda_cen'] = (1. + pars0['redshift'])*656.461 # set default lambda_cen = halpha at redshift
 
         # observation parameters
+        pars0['sigma_thermal'] = 16. # [unit: km/s]
         pars0['psfFWHM'] = 0.5
         pars0['psf_g1'] = 0.
         pars0['psf_g2'] = 0.
@@ -117,7 +122,6 @@ class ParametersTNG:
         
         # comiving distance
         self.Dc = cosmo.comoving_distance(z=redshift).to(u.kpc).value * cosmo.h # [unit: ckpc/h]
-
         
 
 class Subhalo:
@@ -193,8 +197,6 @@ class Subhalo:
                 self.snap[ptlType]['vel'][:, j] += dv[j]
 
     
-
-
 class TNGmock:
 
     def __init__(self, pars, subhalo, par_meta=None):
@@ -213,6 +215,14 @@ class TNGmock:
         self._init_constants()
 
         self.line_species = self._lines_within_lambdaGrid()
+        
+        if len(self.line_species)==1 :
+            self.lambda0 = self.Pars.lineLambda0[self.line_species[0]]
+        else :
+            self._lambda0s = [self.Pars.lineLambda0[self.line_species[i]] for i in range(len(self.line_species))]
+            self.lambda0 = np.mean(self._lambda0s)
+        
+        self.z = self.Pars.fid['redshift']
     
     def _init_constants(self):   
         self.c_kms = 2.99792458e5
@@ -248,8 +258,9 @@ class TNGmock:
 
         return lambdaLOS
 
-    def _massCube_i(self, ptlType, lineType, subhalo):
+    def _massCube_i(self, ptlType, lineType, subhalo, weights='mass'):
         '''Generate the massCube for given ptlType, lineType
+
             Returns:
                 massCube: 3D array (x, y, lambda) [unit: Msun/h / pix^3]
             
@@ -267,21 +278,31 @@ class TNGmock:
         x_arcsec = subhalo.snap[ptlType]['pos'][:, 0]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
         y_arcsec = subhalo.snap[ptlType]['pos'][:, 1]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
         lambdaLOS = self.vLOS_to_lambda(subhalo.snap[ptlType]['vel'][:, 2], lineType=lineType) #[unit: nm]
-        mass = subhalo.snap[ptlType]['mass']*1.e10  # [unit: Msun/h]
 
-        #massCube, _ = np.histogramdd((x_arcsec, y_arcsec, lambdaLOS), bins=(self.spaceGrid_edg, self.spaceGrid_edg, self.lambdaGrid_edg), weights=mass) 
-        massCube, _ = np.histogramdd((y_arcsec, x_arcsec, lambdaLOS), 
-                        bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=mass)
+        if weights=='mass':
+            mass = subhalo.snap[ptlType]['mass']*1.e10  # [unit: Msun/h]
+            massCube, _ = np.histogramdd((y_arcsec, x_arcsec, lambdaLOS), 
+                                         bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=mass)
+        elif weights == 'SFR':
+            massCube, _ = np.histogramdd((y_arcsec, x_arcsec, lambdaLOS),
+                                         bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=subhalo.snap['gas']['SFR'])
+        else:
+            raise ValueError('weights needs to be either \'mass\' or \'SFR\'')
 
         return massCube
     
-    def gen_massCube(self, ptlTypes, lineTypes, subhalo):
+    def gen_massCube(self, ptlTypes, lineTypes, subhalo, weights='mass'):
         '''Generate the the sum of massCube for all input ptlTypes and lineTypes
+
             Args:
                 ptlTypes: list
                     e.g. ptlTypes = ['gas', 'stars']
                 lineTypes: list, line species that fall within the range of lambdaGrid
                     lineTypes = self.line_species
+                weights :  'mass' or 'SFR'
+                    the weighting factor to pass into np.histogramdd
+                    for 'SFR' weights, ptlType can only be ['gas']
+
             Returns:
                 massCube: 3D array (x, y, lambda)
                     [unit: Msun/h /x_grid/y_grid/lambda_grid
@@ -291,7 +312,7 @@ class TNGmock:
 
         for lineType in lineTypes:
             for ptlType in ptlTypes:
-                massCube += self._massCube_i(ptlType, lineType, subhalo)
+                massCube += self._massCube_i(ptlType, lineType, subhalo, weights)
 
         return massCube
     
@@ -328,13 +349,18 @@ class TNGmock:
 
         for k in range(self.Pars.lambdaGrid.size):
             thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.pixScale)
-            noise = galsim.CCDNoise(sky_level = sky.spec1D[k], read_noise = self.Pars.fid['read_noise'])
+            noise = galsim.CCDNoise(sky_level = sky.spec1D_arr[k], read_noise = self.Pars.fid['read_noise'])
             noiseImage = thisIm.copy()
             noiseImage.addNoise(noise)
 
             specCube.array[:, :, k] = noiseImage.array
         
         return specCube
+    
+    def cal_sigma_thermal_nm(self, sigma_thermal_kms):
+        '''Compute sigma_thermal in unit the same as lambdaGrid, given sigma_thermal in [km/s]'''
+        return self.Pars.fid['lambda_cen']*sigma_thermal_kms/self.c_kms
+
     
     def gen_mock_data(self, noise_mode=0):
         '''generate mock data_info dict.
@@ -365,11 +391,25 @@ class TNGmock:
         self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
 
         # 3. generate specCube
-        massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, subhalo=self.subhalo)
-
+        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, subhalo=self.subhalo)
+        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, subhalo=self.subhalo, weights='SFR')
         self.specCube = self.mass_to_light(massCube)
+
+        # 3.1 add psf for each plan at lambdaGrid[i]
         self.specCube.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
 
+        # 3.2 smooth spectrum
+            # thermal part
+        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.fid['sigma_thermal'])
+            # spectral resoultion part
+        self.sigma_resolution_nm = self.Pars.fid['lambda_cen']/self.Pars.fid['Resolution']
+        self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 +  self.sigma_resolution_nm**2)
+
+            # quick approximated way
+        self.specCube.add_spec_sigma_approx(sigma=self.sigma_tot)
+        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm)
+
+        # 3.3 flux renorm
         self.specCube = self.flux_renorm(self.specCube)
 
         # 4. compute sky noise
@@ -379,42 +419,41 @@ class TNGmock:
         if noise_mode == 1:
             self.specCube = self.add_sky_noise(self.specCube, self.sky)
         
-        # 4.1 adjust the cutout range of the specCube
-        #Nk = len(self.specCube.lambdaGrid)
-        #nout = 20
-        #self.specCube0 = self.specCube
-        #self.specCube = self.specCube.cutout(xlim=[-4.0, 4.0], id_LOS=list(range(nout,Nk-nout)))
-
         # 5. compute photometry
-        self.image = Image(self.specCube)
+        self.image = Image(self.specCube, signal_to_noise=100.)
 
         # 6. compute slit spectra
         spectra = Slit(self.specCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=self.Pars.fid['slitAngles'])
 
-
-        data_info = {   'spec_variance': self.sky.spec2D, 
+        dataInfo = {    'spec_variance': self.sky.spec2D_arr,
                         'image_variance': self.image.gen_image_variance(signal_to_noise=100),
                         'par_fid': self.Pars.fid,
-                        'flux_norm': np.sum(self.image.array),
-                        'line_species': self.line_species[0]    }
+                        'flux_norm': np.sum(self.image.array)   }
         
-        data_info['spec'] = spectra
-        data_info['image'] = self.image.array
+        if len(self.line_species)==1 :  # singlet
+            dataInfo['line_species'] = self.line_species[0]
+        else:                           # doublets
+            dataInfo['line_species'] = self.line_species[0][:-1]
+        
+        dataInfo['image'] = self.image
+        dataInfo['spec'] = spectra
 
-        data_info['par_fid']['vcirc'] = self.subhalo.info['vmax']
-        data_info['par_fid']['r_hl_image'] = 0.5
-        data_info['par_fid']['vscale'] = 0.5
-        data_info['par_fid']['r_0'] = 0.0
-        data_info['par_fid']['v_0'] = 0.0
-        data_info['par_fid']['flux'] = data_info['flux_norm']
-        data_info['par_fid']['subGridPixScale'] = self.specCube.pixScale
-        data_info['par_fid']['ngrid'] = self.image.ngrid
-        data_info['lambdaGrid'] = self.specCube.lambdaGrid
-        data_info['spaceGrid'] = self.specCube.spaceGrid
-        data_info['lambda_emit'] = self.Pars.lineLambda0[self.line_species[0]]
+        for j in range(len(dataInfo['spec'])):
+            dataInfo['spec'][j] = Spec2D(array=dataInfo['spec'][j], array_var=dataInfo['spec_variance'],spaceGrid=self.specCube.spaceGrid, lambdaGrid=self.specCube.lambdaGrid, line_species=dataInfo['line_species'], z=self.z, auto_cut=False)
 
+        dataInfo['par_fid']['vcirc'] = self.subhalo.info['vmax']
+        dataInfo['par_fid']['r_hl_image'] = 0.5
+        dataInfo['par_fid']['vscale'] = 0.5
+        dataInfo['par_fid']['r_0'] = 0.0
+        dataInfo['par_fid']['v_0'] = 0.0
+        dataInfo['par_fid']['flux'] = dataInfo['flux_norm']
+        dataInfo['par_fid']['subGridPixScale'] = self.specCube.pixScale
+        dataInfo['par_fid']['ngrid'] = self.image.ngrid
+        dataInfo['lambdaGrid'] = self.specCube.lambdaGrid
+        dataInfo['spaceGrid'] = self.specCube.spaceGrid
+        dataInfo['lambda0'] = self.lambda0
 
-        return data_info
+        return dataInfo
 
 
 class Sky:
@@ -430,7 +469,7 @@ class Sky:
         self.skyTemplate = fits.getdata(skyfile)
 
     @property
-    def spec1D(self):
+    def spec1D_arr(self):
         '''
             raw sky flux in the file is: photon/s/m2/micron/arcsec2
             convert skySpec1D unit to photon/s/cm2/nm/arcsec2
@@ -447,12 +486,12 @@ class Sky:
     def skyCube(self):
 
         skyArray = np.empty([self.Pars.fid['ngrid'], self.Pars.fid['ngrid'], self.Pars.lambdaGrid.size])
-        skyArray[:, :, :] = self.spec1D[None, None, :]
+        skyArray[:, :, :] = self.spec1D_arr[None, None, :]
 
         return SpecCube(skyArray, self.Pars.spaceGrid, self.Pars.lambdaGrid)
     
     @property
-    def spec2D(self):
+    def spec2D_arr(self):
         spec = Slit(self.skyCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=[0.])[0]
         return spec
 
@@ -480,6 +519,10 @@ class Image:
         
         if 'array_var' in kwargs:
             self.array_var = kwargs.pop('array_var')
+        
+        if 'signal_to_noise' in kwargs:
+            self.signal_to_noise = kwargs.pop('signal_to_noise')
+            self.array_var = self.gen_image_variance(signal_to_noise=self.signal_to_noise)
     
     @property
     def pixScale(self):
@@ -512,11 +555,8 @@ class Image:
         return Image(new_image, new_spaceGrid)
     
     def gen_image_variance(self, signal_to_noise):
-        
         gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.pixScale)
-
         variance = gsImg.addNoiseSNR(galsim.GaussianNoise(), signal_to_noise, preserve_flux=True)
-
         return variance
     
     def _get_mesh(self, mode='corner'):
@@ -729,7 +769,7 @@ class SpecCube:
             newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale))
             self.array[:,:,k] = newImage.array
 
-    def kernel_at_k(self, k, sigma2Grid):
+    def _kernel_at_k(self, k, sigma2Grid):
         #return 1./np.sqrt(2*np.pi*self.sigma2Grid[k]) * np.exp(- (self.lambdaGrid[k]-self.lambdaGrid)**2 / (2.*self.sigma2Grid[k]))
         weight = np.exp(- (self.lambdaGrid[k]-self.lambdaGrid)**2 / (2.*sigma2Grid[k]))
         weight /= weight.sum()
@@ -739,17 +779,34 @@ class SpecCube:
 
         smoothed_spec1D = np.zeros(len(spec1D))
         for k in range(len(self.lambdaGrid)):
-            weightGird = self.kernel_at_k(k, sigma2Grid)
+            weightGird = self._kernel_at_k(k, sigma2Grid)
             smoothed_spec1D[k] = np.sum(weightGird*spec1D)
         return smoothed_spec1D
     
-    def add_spec_resolution(self, resolution):
-        '''Smooth along lambdaGrid for photonCube for spectragraph resolution.
-            Note: Don't need to smooth if sigma = np.sqrt(sigma2Grid) is << nm_per_pixel
+    def add_spec_sigma(self, resolution, sigma_thermal_nm=None):
+        '''Smooth along the lambdaGrid for photonCube given spectragraph resolution, sigma_thermal
+            Args:
+                resolution: spectral resolution
+                    Keck resolution = 5000
+                sigma_thermal_nm: thermal contribution of velocity dispersion in unit: nm
         '''
-        sigma2Grid = self.lambdaGrid/resolution**2
+
+        if sigma_thermal_nm is not None:
+            sigma2Grid = (self.lambdaGrid/resolution)**2 + sigma_thermal_nm**2
+        else:
+            sigma2Grid = (self.lambdaGrid/resolution)**2
 
         for i, x in enumerate(self.spaceGrid):
             for j, y in enumerate(self.spaceGrid):
                 self.array[j, i, :] = self._smooth_spec11D(spec1D=self.array[j, i, :], sigma2Grid=sigma2Grid)
 
+    def add_spec_sigma_approx(self, sigma):
+        '''Perform gaussian smooth in lambdaGrid direction, given sigma. 
+           This mehtod is a quick approximation of self.add_spec_sigma
+            Args: 
+                sigma : real, in the same unit as lambdaGrid [unit: nm]
+                    sigma = np.sqrt((lambda_cen/resolution)**2 + sigma_thermal_nm**2)
+        '''
+        sigma_pix = sigma/self.nm_per_pixel  # sigma in [unit: pix]
+        self.array = gaussian_filter1d(self.array, sigma_pix, axis=2)
+        
