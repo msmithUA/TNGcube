@@ -258,7 +258,7 @@ class TNGmock:
 
         return lambdaLOS
 
-    def _massCube_i(self, ptlType, lineType, subhalo, weights='mass'):
+    def _massCube_i(self, ptlType, lineType, weights='mass'):
         '''Generate the massCube for given ptlType, lineType
 
             Returns:
@@ -275,23 +275,23 @@ class TNGmock:
                     imshow(np.sum(massArray.T, axis = 2), origin='lower')    # for TNGCube.massCube
         '''
         
-        x_arcsec = subhalo.snap[ptlType]['pos'][:, 0]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
-        y_arcsec = subhalo.snap[ptlType]['pos'][:, 1]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
-        lambdaLOS = self.vLOS_to_lambda(subhalo.snap[ptlType]['vel'][:, 2], lineType=lineType) #[unit: nm]
+        x_arcsec = self.subhalo.snap[ptlType]['pos'][:, 0]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
+        y_arcsec = self.subhalo.snap[ptlType]['pos'][:, 1]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
+        lambdaLOS = self.vLOS_to_lambda(self.subhalo.snap[ptlType]['vel'][:, 2], lineType=lineType) #[unit: nm]
 
         if weights=='mass':
-            mass = subhalo.snap[ptlType]['mass']*1.e10  # [unit: Msun/h]
+            mass = self.subhalo.snap[ptlType]['mass']*1.e10  # [unit: Msun/h]
             massCube, _ = np.histogramdd((y_arcsec, x_arcsec, lambdaLOS), 
                                          bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=mass)
         elif weights == 'SFR':
             massCube, _ = np.histogramdd((y_arcsec, x_arcsec, lambdaLOS),
-                                         bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=subhalo.snap['gas']['SFR'])
+                                         bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg, self.Pars.lambdaGrid_edg), weights=self.subhalo.snap['gas']['SFR'])
         else:
             raise ValueError('weights needs to be either \'mass\' or \'SFR\'')
 
         return massCube
     
-    def gen_massCube(self, ptlTypes, lineTypes, subhalo, weights='mass'):
+    def gen_massCube(self, ptlTypes, lineTypes, weights='mass'):
         '''Generate the the sum of massCube for all input ptlTypes and lineTypes
 
             Args:
@@ -312,10 +312,36 @@ class TNGmock:
 
         for lineType in lineTypes:
             for ptlType in ptlTypes:
-                massCube += self._massCube_i(ptlType, lineType, subhalo, weights)
+                massCube += self._massCube_i(ptlType, lineType, weights)
 
         return massCube
     
+    def gen_photometry(self, band='r', weights='intensity'):
+        '''Generate galaxy photometry (2D image)
+            Args:
+                band : str
+                    available bands : U, B, V, K, g, r, i, z
+                weights : 'intensity' or 'mass'
+                    if weights == 'mass', use ptl mass to build 2D image histogram
+                    if weights == 'intensity', use the stellar ptl photometry (in given band) as weights to build 2D image.
+        '''
+        x_arcsec = self.subhalo.snap['stars']['pos'][:, 0]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
+        y_arcsec = self.subhalo.snap['stars']['pos'][:, 1]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
+
+        if weights == 'mass':
+            imageArr, _ = np.histogramdd((y_arcsec, x_arcsec),
+                            bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg), 
+                            weights=self.subhalo.snap['stars']['mass']*1.e10, density=True)
+
+        if weights == 'intensity':
+            IDband = 'UBVKgriz'.index(band)
+            mAB = self.subhalo.snap['stars']['GFM_StellarPhotometrics'][:, IDband] # [unit: AB magnitude]
+            intensity = 10**((mAB+48.60)/(-2.5))                                   # [unit: erg/s 1/Hz 1/cm^2]
+            imageArr, _ = np.histogramdd((y_arcsec, x_arcsec),
+                            bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg), 
+                            weights=intensity, density=True)
+        return imageArr
+        
     def mass_to_light(self, massCube, MLratio=4.e-6):
         '''turn the unit of massCube (Msun/h /pix^3) to photonCube wiht unit Nphotons/pix^3.
             Args:
@@ -391,8 +417,8 @@ class TNGmock:
         self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
 
         # 3. generate specCube
-        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, subhalo=self.subhalo)
-        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, subhalo=self.subhalo, weights='SFR')
+        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, weights='mass')
+        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, weights='SFR')
         self.specCube = self.mass_to_light(massCube)
 
         # 3.1 add psf for each plan at lambdaGrid[i]
@@ -403,11 +429,11 @@ class TNGmock:
         self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.fid['sigma_thermal'])
             # spectral resoultion part
         self.sigma_resolution_nm = self.Pars.fid['lambda_cen']/self.Pars.fid['Resolution']
-        self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 +  self.sigma_resolution_nm**2)
+        self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 + self.sigma_resolution_nm**2)
 
-            # quick approximated way
+            # smoothing with quick approximated way
         self.specCube.add_spec_sigma_approx(sigma=self.sigma_tot)
-        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm)
+        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
 
         # 3.3 flux renorm
         self.specCube = self.flux_renorm(self.specCube)
@@ -419,8 +445,22 @@ class TNGmock:
         if noise_mode == 1:
             self.specCube = self.add_sky_noise(self.specCube, self.sky)
         
-        # 5. compute photometry
-        self.image = Image(self.specCube, signal_to_noise=100.)
+        # 5. generate mock photometry
+        ### Option 1 - image based on stacking specCube along lambdaGrid direction
+        #self.image = Image(self.specCube)
+        
+        ### Option 2 - image based on stellar particle photometry
+        imageArr = self.gen_photometry(band='r', weights='intensity')
+        self.image = Image(imageArr, self.Pars.spaceGrid)
+
+        # 5.1 add psf to image
+        self.image.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+
+        # 5.2 compute noise given SNR or add noise to self.image.array
+        if noise_mode == 1:
+            self.image.array_var = self.image.gen_image_variance(signal_to_noise=100., add_noise=True)
+        else:
+            self.image.array_var = self.image.gen_image_variance(signal_to_noise=100., add_noise=False)
 
         # 6. compute slit spectra
         spectra = Slit(self.specCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=self.Pars.fid['slitAngles'])
@@ -498,9 +538,14 @@ class Sky:
         
 class Image:
     '''The image data class
-        Ways to construct an Image:
+        Two ways to construct an Image:
         > Image(array2D, spaceGrid)
         > Image(SpecCube)
+
+        kwargs:
+            array_var : image_variance for the image array
+            signal_to_noise : 
+                When this keyword is set, the code would call galsim.addNoiseSNR to generate the corresponding array_var for the image. 
     '''
     def __init__(self, *args, **kwargs):
 
@@ -554,10 +599,22 @@ class Image:
 
         return Image(new_image, new_spaceGrid)
     
-    def gen_image_variance(self, signal_to_noise):
+    def gen_image_variance(self, signal_to_noise, add_noise=False):
         gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.pixScale)
         variance = gsImg.addNoiseSNR(galsim.GaussianNoise(), signal_to_noise, preserve_flux=True)
+        if add_noise:  # replace self.array with the noise version
+            self.array = gsImg.array
         return variance
+
+    def add_psf(self, psfFWHM, psf_g1, psf_g2):
+        psf = galsim.Gaussian(fwhm=psfFWHM)
+        psf = psf.shear(g1=psf_g1, g2=psf_g2)
+
+        thisIm = galsim.Image(np.ascontiguousarray(self.array), scale=self.pixScale)
+        galobj = galsim.InterpolatedImage(image=thisIm)
+        galC = galsim.Convolution([galobj, psf])
+        newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale))
+        self.array = newImage.array
     
     def _get_mesh(self, mode='corner'):
         '''generate coordiante mesh

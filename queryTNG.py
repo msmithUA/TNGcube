@@ -93,7 +93,7 @@ class QueryTNG():
         '''
 
         cutout_request = {'gas': 'Coordinates,Masses,Velocities,StarFormationRate,InternalEnergy',
-                          'stars': 'Coordinates,Masses,Velocities'} 
+                          'stars': 'Coordinates,Masses,Velocities,GFM_StellarPhotometrics' }
                         # 'dm'   :'Coordinates,Velocities'
 
         subhaloURL = self.subhalosURL + f'{int(subhaloID)}/'
@@ -117,6 +117,8 @@ class QueryTNG():
                     Instantaneous star formation rate of this gas cell.
                 snap['InternalEnergy'] : 1d array  [unit: (km/s)^2] (only available for gas ptl.)
                     Internal (thermal) energy per unit mass for this gas cell.
+                snap['GFM_StellarPhotometrics'] : ndarray Nptlx8 [unit: mag]
+                    Stellar magnitudes in eight bands: U, B, V, K, g, r, i, z.
             
             Reference: 
                 https://www.tng-project.org/data/docs/specifications/
@@ -135,6 +137,9 @@ class QueryTNG():
         if ptl_type == 'PartType0':
             snap['InternalEnergy'] = f_hdf5[ptl_type]['InternalEnergy'][:]
             snap['SFR'] = f_hdf5[ptl_type]['StarFormationRate'][:]
+        
+        if ptl_type == 'PartType4':
+            snap['GFM_StellarPhotometrics'] = f_hdf5[ptl_type]['GFM_StellarPhotometrics'][:,:]
         
         # coordinate re-adjustment on subhaloInfo (w.r.t. the subhalo c.m. and system velocity)
         # note that this is not implemented yet.
@@ -168,9 +173,6 @@ class QueryTNG():
 
         return catalog
     
-
-
-
 
 def get(path, params=None):
     # make HTTP GET request to path
