@@ -212,6 +212,8 @@ class TNGmock:
             self.par_meta = par_meta
 
         self.subhalo = subhalo
+        self.init_subhalo_coordinate()
+
         self._init_constants()
 
         self.line_species = self._lines_within_lambdaGrid()
@@ -316,14 +318,14 @@ class TNGmock:
 
         return massCube
     
-    def gen_photometry(self, band='r', weights='intensity'):
-        '''Generate galaxy photometry (2D image)
+    def gen_imageArray(self, band='r', weights='photometry'):
+        '''Generate galaxy image array (2D)
             Args:
                 band : str
                     available bands : U, B, V, K, g, r, i, z
-                weights : 'intensity' or 'mass'
+                weights : 'photometry' or 'mass'
                     if weights == 'mass', use ptl mass to build 2D image histogram
-                    if weights == 'intensity', use the stellar ptl photometry (in given band) as weights to build 2D image.
+                    if weights == 'photometry', use the stellar ptl photometry (in given band) as weights to build 2D image.
         '''
         x_arcsec = self.subhalo.snap['stars']['pos'][:, 0]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
         y_arcsec = self.subhalo.snap['stars']['pos'][:, 1]/self.Pars.Dc * self.radian2arcsec #[unit: arcsec]
@@ -333,7 +335,7 @@ class TNGmock:
                             bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg), 
                             weights=self.subhalo.snap['stars']['mass']*1.e10, density=True)
 
-        if weights == 'intensity':
+        if weights == 'photometry':
             IDband = 'UBVKgriz'.index(band)
             mAB = self.subhalo.snap['stars']['GFM_StellarPhotometrics'][:, IDband] # [unit: AB magnitude]
             intensity = 10**((mAB+48.60)/(-2.5))                                   # [unit: erg/s 1/Hz 1/cm^2]
@@ -387,20 +389,15 @@ class TNGmock:
         '''Compute sigma_thermal in unit the same as lambdaGrid, given sigma_thermal in [km/s]'''
         return self.Pars.fid['lambda_cen']*sigma_thermal_kms/self.c_kms
 
-    
-    def gen_mock_data(self, noise_mode=0):
-        '''generate mock data_info dict.
-            noise_mode = 1 : return noise data
-            noise_mode = 0 : return noiseless data
-        '''
+    def init_subhalo_coordinate(self):
+        ''' Rotate and shear coordinates of subhalo particles'''
         # 1. compute total rotation matrix, Rtot
         R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.fid['spinR'])
         R_sini = sini_rotation(sini=self.Pars.fid['sini'])
         R_pa = PA_rotation(theta=self.Pars.fid['theta_int'])
-
         Rtot = R_pa@R_sini@R_spin
 
-        # 2.0 Perform rotation to subhalo
+        # 2. Perform rotation to subhalo
         self.subhalo.rotation(Rtot)
 
         # 2.1 Perform additional adjustment to subhalo (if par_meta is set)
@@ -412,57 +409,96 @@ class TNGmock:
                 self.subhalo.recenter_pos(dx=self.par_meta['dx'])
             if self.par_meta['dv'] is not None:
                 self.subhalo.recenter_vel(dv=self.par_meta['dv'])
-
+        
         # 2.2 add Shear to subhalo
         self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
 
-        # 3. generate specCube
-        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, weights='mass')
-        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, weights='SFR')
-        self.specCube = self.mass_to_light(massCube)
+    def gen_mock_image(self, weights='photometry', band='r', noise_mode=0):
+        '''Generate mock image
+            Three options to generate mock image:
+            - Option1 : image based on stacking specCube along lambdaGrid direction
+                >> self.gen_mock_image(weight='line')
+            - Option2 : image based on stellar particle photometry
+                >> self.gen_mock_image(weight='photometry', band='r')
+            - Option3 : image based on stellar particle mass
+                >> self.gen_mock_image(weight='mass')
 
-        # 3.1 add psf for each plan at lambdaGrid[i]
-        self.specCube.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+            Args:
+                weights : weights for each image pixel
+                    weights = 'line', 'photometry', 'mass' 
 
-        # 3.2 smooth spectrum
-            # thermal part
-        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.fid['sigma_thermal'])
-            # spectral resoultion part
-        self.sigma_resolution_nm = self.Pars.fid['lambda_cen']/self.Pars.fid['Resolution']
-        self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 + self.sigma_resolution_nm**2)
+            develop log:
+                The computation when weights == 'line' is slow... it requires generating noiseless specCube first.
+                specCube0 is likely to be computed twice throughout the operation of this code...
+                Better reorganization of the code would be needed.
+        '''
 
-            # smoothing with quick approximated way
-        self.specCube.add_spec_sigma_approx(sigma=self.sigma_tot)
-        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
+        if weights == 'photometry':
+            imageArr = self.gen_imageArray(band=band, weights='photometry')
+            self.image = Image(imageArr, self.Pars.spaceGrid)
+        elif weights == 'mass':
+            imageArr = self.gen_imageArray(weights='mass')
+            self.image = Image(imageArr, self.Pars.spaceGrid)
+        elif weights == 'line':
+            specCube0 = self.gen_mock_specCube(noise_mode=0)
+            self.image = Image(specCube0)
+        else:
+            raise ValueError("Invalid weights argument. weights = \'photometry\', \'mass\', \'intensity\' ")
 
-        # 3.3 flux renorm
-        self.specCube = self.flux_renorm(self.specCube)
-
-        # 4. compute sky noise
-        self.sky = Sky(self.Pars)
-
-        # add sky noise to specCube if noise_mode is 1.
-        if noise_mode == 1:
-            self.specCube = self.add_sky_noise(self.specCube, self.sky)
-        
-        # 5. generate mock photometry
-        ### Option 1 - image based on stacking specCube along lambdaGrid direction
-        #self.image = Image(self.specCube)
-        
-        ### Option 2 - image based on stellar particle photometry
-        imageArr = self.gen_photometry(band='r', weights='intensity')
-        self.image = Image(imageArr, self.Pars.spaceGrid)
-
-        # 5.1 add psf to image
+        # add psf to image
         self.image.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
-
-        # 5.2 compute noise given SNR or add noise to self.image.array
+        
+        # compute noise given SNR or add noise to self.image.array
         if noise_mode == 1:
             self.image.array_var = self.image.gen_image_variance(signal_to_noise=100., add_noise=True)
         else:
             self.image.array_var = self.image.gen_image_variance(signal_to_noise=100., add_noise=False)
 
-        # 6. compute slit spectra
+        return self.image
+        
+    def gen_mock_specCube(self, noise_mode=0):
+
+        # 1. generate specCube
+        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, weights='mass')
+        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, weights='SFR')
+        self.specCube = self.mass_to_light(massCube)
+
+        # 2. add psf for each plan at lambdaGrid[i]
+        self.specCube.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+
+        # 3 smooth spectrum
+        # thermal part
+        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.fid['sigma_thermal'])
+        # spectral resoultion part
+        self.sigma_resolution_nm = self.Pars.fid['lambda_cen'] / self.Pars.fid['Resolution']
+        self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 + self.sigma_resolution_nm**2)
+
+        # smoothing with quick approximated way
+        self.specCube.add_spec_sigma_approx(sigma=self.sigma_tot)
+        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
+
+        # 4. flux renorm
+        self.specCube = self.flux_renorm(self.specCube)
+
+        # 5. compute sky noise
+        self.sky = Sky(self.Pars)
+
+        # 6. add sky noise to specCube if noise_mode is 1.
+        if noise_mode == 1:
+            self.specCube = self.add_sky_noise(self.specCube, self.sky)
+
+        return self.specCube
+
+    
+    def gen_mock_data(self, noise_mode=0):
+        '''generate mock data_info dict.
+            noise_mode = 1 : return noise data
+            noise_mode = 0 : return noiseless data
+        '''
+
+        self.specCube = self.gen_mock_specCube(noise_mode=noise_mode)
+        self.image = self.gen_mock_image(weights='photometry', band='r', noise_mode=noise_mode)
+
         spectra = Slit(self.specCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=self.Pars.fid['slitAngles'])
 
         dataInfo = {    'spec_variance': self.sky.spec2D_arr,
