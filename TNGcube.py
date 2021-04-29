@@ -28,22 +28,46 @@ class ParametersTNG:
                    'OIIIa': 496.0295, 'OIIIb': 500.8240,
                    'Halpha': 656.461}  # [unit: nm]
 
-    def __init__(self, par_in=None):
+    def __init__(self, **kwargs):
+        '''The parameter object to store parameters to interact with TNGmock & Sky
+            Kwargs:
+                lambda_cen: real
+                    defines the central value of lambdaGrid
+                line_species: str
+                    available values are : 'OII', 'OIII', 'Halpha'
+                    If line_species is passed as a kwarg, self.fid['lambda_cen'] would be overwritten by the redshifted center of the given line_species. i.e. if line_species='Halpha', lambda_cen = (1+redshift)*656.461 .
 
-        # 1. set default parameters of TNGcube
-        self._pars0 = self._init_pars()
+                Other available keyward arguments are defined in self.pars0.keys() .
+                See self._init_default() method for detail.
 
-        # 2. define parameter dictionary, pars, based on user input, par_in
-        #    for parameters thart are not defined, use their default value as par0
-        self.fid = self._pars0.copy()
-        if par_in is not None:
-            for key in par_in.keys():
-                self.fid[key] = par_in[key]
+            Examples:
+                eg0: simply use the default parameter values
+                    >> Pars = ParametersTNG()
+                eg1: pass kwargs to be changed w.r.t. the default parameter dict (self.par0).
+                    >> Pars = ParametersTNG(sini=0.8, g1=0.05, g2=0.05)
+                eg2: pass a dictionary of parameters 
+                    >> par_in = {'sini':0.8, 'g1':0.05, 'g2':0.05}
+                    >> Pars = ParametersTNG(**par_in)
         
-        self.add_cosmoRedshift(redshift=self.fid['redshift'])
-        self.define_grids(pars=self.fid)
+        '''
+        # 1. init the default parameters of TNGcube
+        self.pars0 = self._init_default()
 
-    def _init_pars(self):
+        # 2. update the fidicual parameters based on the user input
+        self.fid = {**self.pars0, **kwargs}
+
+        if 'line_species' in kwargs: 
+            if kwargs['line_species'] in ['OII', 'OIII']: # doubles
+                line_doubles = [kwargs['line_species']+'a', kwargs['line_species']+'b']
+                lambda0 = np.mean([ParametersTNG.lineLambda0[key] for key in line_doubles])
+                self.fid['lambda_cen'] = (1.+self.fid['redshift']) * lambda0
+            else: # singlets
+                self.fid['lambda_cen'] = (1.+self.fid['redshift'])*ParametersTNG.lineLambda0[kwargs['line_species']]
+        
+        self.add_cosmoRedshift()
+        self.define_grids()
+
+    def _init_default(self):
         '''Initiate default parameters'''
 
         pars0 = {}
@@ -72,7 +96,7 @@ class ParametersTNG:
         pars0['psf_g2'] = 0.
         pars0['Resolution'] = 5000. # for Keck
 
-        pars0['slitWidth'] = 0.06
+        pars0['slitWidth'] = 0.12
 
         # line intensity
         pars0['expTime'] = 30.*60.              # [unit: sec]
@@ -97,31 +121,37 @@ class ParametersTNG:
 
         return int_peakI/energy_per_photon
     
-    def define_grids(self, pars):
+    def define_grids(self):
 
         # grid parameters
-        self.extent = pars['image_size'] * pars['pixScale']
-        self.subGridPixScale = self.extent/pars['ngrid']
-        self.lambda_min = pars['lambda_cen'] - 2.
-        self.lambda_max = pars['lambda_cen'] + 2.
+        self.extent = self.fid['image_size'] * self.fid['pixScale']
+        self.subGridPixScale = self.extent/self.fid['ngrid']
+        self.lambda_min = self.fid['lambda_cen'] - 2.
+        self.lambda_max = self.fid['lambda_cen'] + 2.
 
-        self.spaceGrid = gen_grid(cen=0., pixScale=self.subGridPixScale, Ngrid=pars['ngrid'])
-        Ngrid_l = int((self.lambda_max-self.lambda_min)/pars['nm_per_pixel'])+1
-        self.lambdaGrid = gen_grid(cen=pars['lambda_cen'], pixScale=pars['nm_per_pixel'], Ngrid=Ngrid_l)
+        self.spaceGrid = gen_grid(cen=0., pixScale=self.subGridPixScale, Ngrid=self.fid['ngrid'])
+        Ngrid_l = int((self.lambda_max-self.lambda_min)/self.fid['nm_per_pixel'])+1
+        self.lambdaGrid = gen_grid(cen=self.fid['lambda_cen'], pixScale=self.fid['nm_per_pixel'], Ngrid=Ngrid_l)
 
         self.spaceGrid_edg = np.append(self.spaceGrid-self.subGridPixScale/2., self.spaceGrid[-1]+self.subGridPixScale/2.)
-        self.lambdaGrid_edg = np.append(self.lambdaGrid-pars['nm_per_pixel']/2., self.lambdaGrid[-1]+pars['nm_per_pixel']/2.)
-    
-        return pars
-    
-    def add_cosmoRedshift(self, redshift):
+        self.lambdaGrid_edg = np.append(self.lambdaGrid-self.fid['nm_per_pixel']/2., self.lambdaGrid[-1]+self.fid['nm_per_pixel']/2.)
+        
+    def add_cosmoRedshift(self):
 
         # wavelength of lines being redshifted by cosmic expansion
-        self.lineLambdaC = {key: (1.+redshift)*self.lineLambda0[key]
+        self.lineLambdaC = {key: (1.+self.fid['redshift'])*self.lineLambda0[key]
                             for key in self.lineLambda0.keys()}
         
         # comiving distance
-        self.Dc = cosmo.comoving_distance(z=redshift).to(u.kpc).value * cosmo.h # [unit: ckpc/h]
+        self.Dc = cosmo.comoving_distance(z=self.fid['redshift']).to(u.kpc).value * cosmo.h # [unit: ckpc/h]
+    
+    def __getitem__(self, key):
+        '''allowing calling self[key] to access self.fid[key]'''
+        return self.fid[key]
+    
+    def __getattr__(self, key):
+        '''allowing calling self.key to access self.fid['key']'''
+        return self.fid[key]
         
 
 class Subhalo:
@@ -202,7 +232,7 @@ class TNGmock:
     def __init__(self, pars, subhalo, par_meta=None):
 
         if isinstance(pars, dict):
-            self.Pars = ParametersTNG(par_in=pars)
+            self.Pars = ParametersTNG(**pars)
         elif isinstance(pars, ParametersTNG):
             self.Pars = pars
         else:
@@ -364,7 +394,7 @@ class TNGmock:
         return specCube
         
     def flux_renorm(self, specCube):
-        '''Perform flux re-normalization for photonCube such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars.fid['ref_SDSS_peakI']*expTime*area
+        '''Perform flux re-normalization for photonCube such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars['ref_SDSS_peakI']*expTime*area
         '''
         spec1D = Fiber(specCube).get_spectrum(fiberR=1.5)  # SDSS fiber Radius=1.5 arcsec
         Nphoton_peak = spec1D.max()*u.photon/u.nm
@@ -377,7 +407,7 @@ class TNGmock:
 
         for k in range(self.Pars.lambdaGrid.size):
             thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.pixScale)
-            noise = galsim.CCDNoise(sky_level = sky.spec1D_arr[k], read_noise = self.Pars.fid['read_noise'])
+            noise = galsim.CCDNoise(sky_level = sky.spec1D_arr[k], read_noise = self.Pars.read_noise)
             noiseImage = thisIm.copy()
             noiseImage.addNoise(noise)
 
@@ -387,14 +417,14 @@ class TNGmock:
     
     def cal_sigma_thermal_nm(self, sigma_thermal_kms):
         '''Compute sigma_thermal in unit the same as lambdaGrid, given sigma_thermal in [km/s]'''
-        return self.Pars.fid['lambda_cen']*sigma_thermal_kms/self.c_kms
+        return self.Pars.lambda_cen*sigma_thermal_kms/self.c_kms
 
     def init_subhalo_coordinate(self):
         ''' Rotate and shear coordinates of subhalo particles'''
         # 1. compute total rotation matrix, Rtot
-        R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.fid['spinR'])
-        R_sini = sini_rotation(sini=self.Pars.fid['sini'])
-        R_pa = PA_rotation(theta=self.Pars.fid['theta_int'])
+        R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.spinR)
+        R_sini = sini_rotation(sini=self.Pars.sini)
+        R_pa = PA_rotation(theta=self.Pars.theta_int)
         Rtot = R_pa@R_sini@R_spin
 
         # 2. Perform rotation to subhalo
@@ -411,7 +441,7 @@ class TNGmock:
                 self.subhalo.recenter_vel(dv=self.par_meta['dv'])
         
         # 2.2 add Shear to subhalo
-        self.subhalo.shear(g1=self.Pars.fid['g1'], g2=self.Pars.fid['g2'])
+        self.subhalo.shear(g1=self.Pars.g1, g2=self.Pars.g2)
 
     def gen_mock_image(self, weights='photometry', band='r', noise_mode=0):
         '''Generate mock image
@@ -446,7 +476,8 @@ class TNGmock:
             raise ValueError("Invalid weights argument. weights = \'photometry\', \'mass\', \'intensity\' ")
 
         # add psf to image
-        self.image.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+        self.image.add_psf(psfFWHM=self.Pars.psfFWHM,
+                           psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
         
         # compute noise given SNR or add noise to self.image.array
         if noise_mode == 1:
@@ -464,18 +495,20 @@ class TNGmock:
         self.specCube = self.mass_to_light(massCube)
 
         # 2. add psf for each plan at lambdaGrid[i]
-        self.specCube.add_psf(psfFWHM=self.Pars.fid['psfFWHM'], psf_g1=self.Pars.fid['psf_g1'], psf_g2=self.Pars.fid['psf_g2'])
+        self.specCube.add_psf(psfFWHM=self.Pars.psfFWHM,
+                              psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
 
         # 3 smooth spectrum
         # thermal part
-        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.fid['sigma_thermal'])
+        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(
+            sigma_thermal_kms=self.Pars.sigma_thermal)
         # spectral resoultion part
-        self.sigma_resolution_nm = self.Pars.fid['lambda_cen'] / self.Pars.fid['Resolution']
+        self.sigma_resolution_nm = self.Pars.lambda_cen / self.Pars.Resolution
         self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 + self.sigma_resolution_nm**2)
 
         # smoothing with quick approximated way
         self.specCube.add_spec_sigma_approx(sigma=self.sigma_tot)
-        #self.specCube.add_spec_sigma(resolution=self.Pars.fid['Resolution'], sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
+        #self.specCube.add_spec_sigma(resolution=self.Pars.Resolution, sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
 
         # 4. flux renorm
         self.specCube = self.flux_renorm(self.specCube)
@@ -499,7 +532,8 @@ class TNGmock:
         self.specCube = self.gen_mock_specCube(noise_mode=noise_mode)
         self.image = self.gen_mock_image(weights='photometry', band='r', noise_mode=noise_mode)
 
-        spectra = Slit(self.specCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=self.Pars.fid['slitAngles'])
+        spectra = Slit(self.specCube, slitWidth=self.Pars.slitWidth).get_spectra(
+            slitAngles=self.Pars.slitAngles)
 
         dataInfo = {    'spec_variance': self.sky.spec2D_arr,
                         'image_variance': self.image.gen_image_variance(signal_to_noise=100),
@@ -536,7 +570,7 @@ class Sky:
     def __init__(self, pars, skyfile=dir_KLens+'/data/Simulation/skytable.fits'):
 
         if isinstance(pars, dict):
-            self.Pars = ParametersTNG(par_in=pars)
+            self.Pars = ParametersTNG(**pars)
         elif isinstance(pars, ParametersTNG):
             self.Pars = pars
         else:
@@ -553,22 +587,23 @@ class Sky:
         '''
         spec = np.interp(self.Pars.lambdaGrid, self.skyTemplate['lam']*1000., self.skyTemplate['flux'])
         spec /= 1.0e7  # 1/1000 for micron <-> nm ; 1/10000 for m2 <-> cm2
-        spec *= self.Pars.fid['expTime']*self.Pars.fid['area']*self.Pars.fid['throughput'] * \
-            self.Pars.subGridPixScale**2*self.Pars.fid['nm_per_pixel']
+        spec *= self.Pars.expTime*self.Pars.area*self.Pars.throughput * \
+            self.Pars.subGridPixScale**2*self.Pars.nm_per_pixel
 
         return spec
     
     @property
     def skyCube(self):
 
-        skyArray = np.empty([self.Pars.fid['ngrid'], self.Pars.fid['ngrid'], self.Pars.lambdaGrid.size])
+        skyArray = np.empty([self.Pars.ngrid, self.Pars.ngrid, self.Pars.lambdaGrid.size])
         skyArray[:, :, :] = self.spec1D_arr[None, None, :]
 
         return SpecCube(skyArray, self.Pars.spaceGrid, self.Pars.lambdaGrid)
     
     @property
     def spec2D_arr(self):
-        spec = Slit(self.skyCube, slitWidth=self.Pars.fid['slitWidth']).get_spectra(slitAngles=[0.])[0]
+        spec = Slit(self.skyCube, slitWidth=self.Pars.slitWidth).get_spectra(
+            slitAngles=[0.])[0]
         return spec
 
         
@@ -903,3 +938,8 @@ class SpecCube:
         sigma_pix = sigma/self.nm_per_pixel  # sigma in [unit: pix]
         self.array = gaussian_filter1d(self.array, sigma_pix, axis=2)
         
+if __name__ == '__main__':
+    Pars = ParametersTNG(sini=0.8, g1=0.05, g2=0.05, line_species='OII', redshift=0.)
+
+    par_in = {'sini': 0.8, 'g1': 0.05}
+    ParsIn = ParametersTNG(**par_in)
