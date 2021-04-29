@@ -37,8 +37,8 @@ class ParametersTNG:
                     available values are : 'OII', 'OIII', 'Halpha'
                     If line_species is passed as a kwarg, self.fid['lambda_cen'] would be overwritten by the redshifted center of the given line_species. i.e. if line_species='Halpha', lambda_cen = (1+redshift)*656.461 .
 
-                Other available keyward arguments are defined in self.pars0.keys() .
-                See self._init_default() method for detail.
+                Other available keyward arguments are defined in self.base.keys() .
+                See self.set_defaults() method for detail.
 
             Examples:
                 eg0: simply use the default parameter values
@@ -51,10 +51,10 @@ class ParametersTNG:
         
         '''
         # 1. init the default parameters of TNGcube
-        self.pars0 = self._init_default()
+        self.base = self.set_defaults()
 
         # 2. update the fidicual parameters based on the user input
-        self.fid = {**self.pars0, **kwargs}
+        self.fid = {**self.base, **kwargs}
 
         if 'line_species' in kwargs: 
             if kwargs['line_species'] in ['OII', 'OIII']: # doubles
@@ -67,50 +67,54 @@ class ParametersTNG:
         self.add_cosmoRedshift()
         self.define_grids()
 
-    def _init_default(self):
+    def set_defaults(self):
         '''Initiate default parameters'''
 
-        pars0 = {}
-        pars0['redshift'] = 0.4
-        pars0['sini'] = 0.5
-        pars0['theta_int'] = 0.
-        pars0['aspect'] = 0.2
+        base = {}
+        base['redshift'] = 0.4
+        base['sini'] = 0.5
+        base['theta_int'] = 0.
+        base['aspect'] = 0.2
 
-        pars0['spinR'] = [0., 0., -1.]
-        pars0['g1'] = 0.
-        pars0['g2'] = 0.
+        base['spinR'] = [0., 0., -1.]
+        base['g1'] = 0.
+        base['g2'] = 0.
 
         # grid parameters
-        pars0['ngrid'] = 256
-        pars0['image_size'] = 128
-        pars0['pixScale'] = 0.1185
+        base['ngrid'] = 256
+        base['image_size'] = 128
+        base['pixScale'] = 0.1185
 
-        pars0['nm_per_pixel'] = 0.033
+        base['nm_per_pixel'] = 0.033
 
-        pars0['lambda_cen'] = (1. + pars0['redshift'])*656.461 # set default lambda_cen = halpha at redshift
+        # set default lambda_cen = halpha at redshift
+        base['lambda_cen'] = (1. + base['redshift'])*656.461
 
         # observation parameters
-        pars0['sigma_thermal'] = 16. # [unit: km/s]
-        pars0['psfFWHM'] = 0.5
-        pars0['psf_g1'] = 0.
-        pars0['psf_g2'] = 0.
-        pars0['Resolution'] = 5000. # for Keck
+        base['sigma_thermal'] = 16.  # [unit: km/s]
+        base['psfFWHM'] = 0.5
+        base['psf_g1'] = 0.
+        base['psf_g2'] = 0.
+        base['Resolution'] = 5000.  # for Keck
 
-        pars0['slitWidth'] = 0.12
+        base['slitWidth'] = 0.12
 
         # line intensity
-        pars0['expTime'] = 30.*60.              # [unit: sec]
-        pars0['area'] = 3.14 * (1000./2.)**2    # telescope area [unit: cm2]
-        pars0['throughput'] = 0.29
-        # peak of the reference SDSS line intersity at lambda_cen
-        pars0['ref_SDSS_peakI'] = 3.*1e-17     # [unit: erg/s/Angstrom/cm2]
+        base['expTime'] = 30.*60.              # [unit: sec]
+        base['area'] = 3.14 * (1000./2.)**2    # telescope area [unit: cm2]
+        base['throughput'] = 0.29
+        # peak of the reference SDSS line intersity (for a given line_species)
+        base['ref_SDSS_peakI'] = 3.*1e-17     # [unit: erg/s/Angstrom/cm2]
 
-        pars0['read_noise'] = 3.0
+        base['read_noise'] = 3.0
         
-        return pars0
+        return base
     
     @property
-    def int_SDSS_peakI(self):
+    def integrated_peakI(self):
+        '''integrated peak line intensity over telescope area and explosure time
+                self.integrated_peakI : [unit: photons/nm]
+        '''
         ref_peakI = self.fid['ref_SDSS_peakI'] * u.erg/u.second/u.Angstrom/u.cm**2
         ref_peakI = ref_peakI.to(u.erg/u.second/u.nm/u.cm**2)
 
@@ -242,11 +246,11 @@ class TNGmock:
             self.par_meta = par_meta
 
         self.subhalo = subhalo
-        self.init_subhalo_coordinate()
+        self.reset_subhalo_coordinates()
 
-        self._init_constants()
+        self.set_constants()
 
-        self.line_species = self._lines_within_lambdaGrid()
+        self.line_species = self.find_lines_within_lambdaGrid()
         
         if len(self.line_species)==1 :
             self.lambda0 = self.Pars.lineLambda0[self.line_species[0]]
@@ -256,11 +260,11 @@ class TNGmock:
         
         self.z = self.Pars.fid['redshift']
     
-    def _init_constants(self):   
+    def set_constants(self):   
         self.c_kms = 2.99792458e5
         self.radian2arcsec = 206264.806247096
 
-    def _lines_within_lambdaGrid(self):
+    def find_lines_within_lambdaGrid(self):
         '''Find line_species that are within the range covered in lambdaGrid'''
         
         def is_between(lambda_in):
@@ -398,7 +402,7 @@ class TNGmock:
         '''
         spec1D = Fiber(specCube).get_spectrum(fiberR=1.5)  # SDSS fiber Radius=1.5 arcsec
         Nphoton_peak = spec1D.max()*u.photon/u.nm
-        renorm_factor = self.Pars.int_SDSS_peakI/Nphoton_peak
+        renorm_factor = self.Pars.integrated_peakI/Nphoton_peak
         specCube.array *= renorm_factor.value
 
         return specCube
@@ -419,7 +423,7 @@ class TNGmock:
         '''Compute sigma_thermal in unit the same as lambdaGrid, given sigma_thermal in [km/s]'''
         return self.Pars.lambda_cen*sigma_thermal_kms/self.c_kms
 
-    def init_subhalo_coordinate(self):
+    def reset_subhalo_coordinates(self):
         ''' Rotate and shear coordinates of subhalo particles'''
         # 1. compute total rotation matrix, Rtot
         R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.spinR)
