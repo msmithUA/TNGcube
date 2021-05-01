@@ -190,8 +190,8 @@ class Subhalo:
                     total rotation operator : R = R_pa@R_sini@R_spin
         '''
         
-        #for key in ['cm', 'pos', 'spin', 'vel']:
-        #    self.info[key] = self.vec3Dtransform(M=R, vec=self.info[key])
+        for key in ['cm', 'pos', 'spin', 'vel']:
+            self.info[key] = self.vec3Dtransform(M=R, vec=self.info[key])
 
         for ptlType in ['gas', 'stars']:
             for key in ['pos', 'vel']:
@@ -229,11 +229,15 @@ class Subhalo:
         for ptlType in ['gas', 'stars']:
             for j in range(3):
                 self.snap[ptlType]['vel'][:, j] += dv[j]
-
     
+    def standardize_subhalo(self):
+        '''standardize the subhalo coordinate to an face-on disk with spin // [0, 0, -1] (when viweing from the x-y plane)'''
+        R_spin = spin_rotation(spin0=self.info['spin'], spinR=[0., 0., -1.])
+        self.rotation(R_spin)
+
 class TNGmock:
 
-    def __init__(self, pars, subhalo, par_meta=None):
+    def __init__(self, pars, subhalo, par_meta=None, auto_tune=False):
 
         if isinstance(pars, dict):
             self.Pars = ParametersTNG(**pars)
@@ -244,9 +248,8 @@ class TNGmock:
         
         if par_meta is not None:
             self.par_meta = par_meta
-
-        self.subhalo = subhalo
-        self.reset_subhalo_coordinates()
+        else:
+            self.par_meta = None
 
         self.set_constants()
 
@@ -259,6 +262,52 @@ class TNGmock:
             self.lambda0 = np.mean(self._lambda0s)
         
         self.z = self.Pars.fid['redshift']
+
+        self.subhalo = subhalo
+        self.setup_subhalo_coords(auto_tune=auto_tune)
+
+    def setup_subhalo_coords(self, auto_tune=False):
+        ''' Rotate and shear coordinates of subhalo particles'''
+        # 1. compute total rotation matrix, Rtot
+        R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.spinR)
+        R_sini = sini_rotation(sini=self.Pars.sini)
+        R_pa = PA_rotation(theta=self.Pars.theta_int)
+        Rtot = R_pa@R_sini@R_spin
+        self.subhalo.rotation(Rtot)
+
+        if auto_tune:
+            imgArr = self.gen_imageArray(weights='line')
+            img0 = Image(imgArr, self.Pars.spaceGrid)
+            gsImg = img0.gen_galsimImage()
+            self.moments = gsImg.FindAdaptiveMom()
+            # fine tune PA
+            PA0 = self.moments.observed_shape.beta.rad
+            print(f'residual PA = {self.moments.observed_shape.beta.deg:.3f} deg. (auto-corrected)')
+            R_auto = PA_rotation(theta=-PA0)
+            self.subhalo.rotation(R_auto)
+            # fine tune projected center position
+            xcen_pix, ycen_pix = self.moments.moments_centroid.x, self.moments.moments_centroid.y
+            xcen_arcsec = img0.spaceGrid[int(xcen_pix)]+(xcen_pix-int(xcen_pix))*img0.pixScale
+            ycen_arcsec = img0.spaceGrid[int(ycen_pix)]+(ycen_pix-int(ycen_pix))*img0.pixScale
+            print(f'residual center offset: ({xcen_arcsec:.3f}, {ycen_arcsec:.3f}) [arcsec] (auto-corrected)')
+            xcen_ckpc = xcen_arcsec/self.radian2arcsec*self.Pars.Dc
+            ycen_ckpc = ycen_arcsec/self.radian2arcsec*self.Pars.Dc
+            print(f'residual center offset: ({xcen_ckpc:.3f}, {ycen_ckpc:.3f}) [ckpc] (auto-corrected)')
+            self.subhalo.recenter_pos(dx=[-xcen_ckpc, -ycen_ckpc, 0.])
+            
+
+        # 2. Perform additional adjustment to subhalo (if par_meta is set)
+        if self.par_meta is not None:
+            if self.par_meta['theta'] is not None:
+                Rth = PA_rotation(theta=self.par_meta['theta'])
+                self.subhalo.rotation(Rth)
+            if self.par_meta['dx'] is not None:
+                self.subhalo.recenter_pos(dx=self.par_meta['dx'])
+            if self.par_meta['dv'] is not None:
+                self.subhalo.recenter_vel(dv=self.par_meta['dv'])
+
+        # 3. add Shear to subhalo
+        self.subhalo.shear(g1=self.Pars.g1, g2=self.Pars.g2)
     
     def set_constants(self):   
         self.c_kms = 2.99792458e5
@@ -376,6 +425,11 @@ class TNGmock:
             imageArr, _ = np.histogramdd((y_arcsec, x_arcsec),
                             bins=(self.Pars.spaceGrid_edg, self.Pars.spaceGrid_edg), 
                             weights=intensity, density=True)
+        
+        if weights == 'line':
+            photonCube = self.gen_photonCube(ptlTypes=['gas'], weights='SFR')
+            self.specCube0 = SpecCube(photonCube, self.Pars.spaceGrid, self.Pars.lambdaGrid)
+            imageArr = Image(self.specCube0).array
         return imageArr
         
     def mass_to_light(self, massCube, MLratio=4.e-6):
@@ -393,9 +447,13 @@ class TNGmock:
         '''
 
         photonCube = massCube * MLratio
-        specCube = SpecCube(photonCube, self.Pars.spaceGrid, self.Pars.lambdaGrid)
 
-        return specCube
+        return photonCube
+    
+    def gen_photonCube(self, ptlTypes=['gas'], weights='SFR'):
+        massCube = self.gen_massCube(ptlTypes=ptlTypes, lineTypes=self.line_species, weights=weights)
+        photonCube = self.mass_to_light(massCube, MLratio=4.e-6)
+        return photonCube
         
     def flux_renorm(self, specCube):
         '''Perform flux re-normalization for photonCube such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars['ref_SDSS_peakI']*expTime*area
@@ -410,7 +468,7 @@ class TNGmock:
     def add_sky_noise(self, specCube, sky):
 
         for k in range(self.Pars.lambdaGrid.size):
-            thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.pixScale)
+            thisIm = galsim.Image(np.ascontiguousarray(specCube.array[:, :, k]), scale=specCube.pixScale, xmin=0, ymin=0)
             noise = galsim.CCDNoise(sky_level = sky.spec1D_arr[k], read_noise = self.Pars.read_noise)
             noiseImage = thisIm.copy()
             noiseImage.addNoise(noise)
@@ -423,39 +481,15 @@ class TNGmock:
         '''Compute sigma_thermal in unit the same as lambdaGrid, given sigma_thermal in [km/s]'''
         return self.Pars.lambda_cen*sigma_thermal_kms/self.c_kms
 
-    def reset_subhalo_coordinates(self):
-        ''' Rotate and shear coordinates of subhalo particles'''
-        # 1. compute total rotation matrix, Rtot
-        R_spin = spin_rotation(spin0=self.subhalo.info['spin'], spinR=self.Pars.spinR)
-        R_sini = sini_rotation(sini=self.Pars.sini)
-        R_pa = PA_rotation(theta=self.Pars.theta_int)
-        Rtot = R_pa@R_sini@R_spin
-
-        # 2. Perform rotation to subhalo
-        self.subhalo.rotation(Rtot)
-
-        # 2.1 Perform additional adjustment to subhalo (if par_meta is set)
-        if self.par_meta is not None:
-            if self.par_meta['theta'] is not None:
-                Rth = PA_rotation(theta=self.par_meta['theta'])
-                self.subhalo.rotation(Rth)
-            if self.par_meta['dx'] is not None:
-                self.subhalo.recenter_pos(dx=self.par_meta['dx'])
-            if self.par_meta['dv'] is not None:
-                self.subhalo.recenter_vel(dv=self.par_meta['dv'])
-        
-        # 2.2 add Shear to subhalo
-        self.subhalo.shear(g1=self.Pars.g1, g2=self.Pars.g2)
-
     def gen_mock_image(self, weights='photometry', band='r', noise_mode=0):
         '''Generate mock image
             Three options to generate mock image:
             - Option1 : image based on stacking specCube along lambdaGrid direction
-                >> self.gen_mock_image(weight='line')
+                >> self.gen_mock_image(weight='line', noise_mode=0)
             - Option2 : image based on stellar particle photometry
-                >> self.gen_mock_image(weight='photometry', band='r')
+                >> self.gen_mock_image(weight='photometry', band='r', noise_mode=0)
             - Option3 : image based on stellar particle mass
-                >> self.gen_mock_image(weight='mass')
+                >> self.gen_mock_image(weight='mass', noise_mode=0)
 
             Args:
                 weights : weights for each image pixel
@@ -469,16 +503,14 @@ class TNGmock:
 
         if weights == 'photometry':
             imageArr = self.gen_imageArray(band=band, weights='photometry')
-            self.image = Image(imageArr, self.Pars.spaceGrid)
         elif weights == 'mass':
             imageArr = self.gen_imageArray(weights='mass')
-            self.image = Image(imageArr, self.Pars.spaceGrid)
         elif weights == 'line':
-            specCube0 = self.gen_mock_specCube(noise_mode=0)
-            self.image = Image(specCube0)
+            imageArr = self.gen_imageArray(weights='line')
         else:
             raise ValueError("Invalid weights argument. weights = \'photometry\', \'mass\', \'intensity\' ")
 
+        self.image = Image(imageArr, self.Pars.spaceGrid)
         # add psf to image
         self.image.add_psf(psfFWHM=self.Pars.psfFWHM,
                            psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
@@ -494,18 +526,16 @@ class TNGmock:
     def gen_mock_specCube(self, noise_mode=0):
 
         # 1. generate specCube
-        #massCube = self.gen_massCube(ptlTypes=['gas', 'stars'], lineTypes=self.line_species, weights='mass')
-        massCube = self.gen_massCube(ptlTypes=['gas'], lineTypes=self.line_species, weights='SFR')
-        self.specCube = self.mass_to_light(massCube)
+        #photonCube = self.gen_photonCube(ptlTypes=['gas', 'stars'], weights='mass')
+        photonCube = self.gen_photonCube(ptlTypes=['gas'], weights='SFR')
+        self.specCube = SpecCube(photonCube, self.Pars.spaceGrid, self.Pars.lambdaGrid)
 
         # 2. add psf for each plan at lambdaGrid[i]
-        self.specCube.add_psf(psfFWHM=self.Pars.psfFWHM,
-                              psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
+        self.specCube.add_psf(psfFWHM=self.Pars.psfFWHM, psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
 
         # 3 smooth spectrum
         # thermal part
-        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(
-            sigma_thermal_kms=self.Pars.sigma_thermal)
+        self.sigma_thermal_nm = self.cal_sigma_thermal_nm(sigma_thermal_kms=self.Pars.sigma_thermal)
         # spectral resoultion part
         self.sigma_resolution_nm = self.Pars.lambda_cen / self.Pars.Resolution
         self.sigma_tot = np.sqrt(self.sigma_thermal_nm**2 + self.sigma_resolution_nm**2)
@@ -526,16 +556,16 @@ class TNGmock:
 
         return self.specCube
 
-    
     def gen_mock_data(self, noise_mode=0):
         '''generate mock data_info dict.
             noise_mode = 1 : return noise data
             noise_mode = 0 : return noiseless data
         '''
 
+        #self.image = self.gen_mock_image(weights='photometry', band='r', noise_mode=noise_mode)
+        self.image = self.gen_mock_image(weights='line', noise_mode=noise_mode)
         self.specCube = self.gen_mock_specCube(noise_mode=noise_mode)
-        self.image = self.gen_mock_image(weights='photometry', band='r', noise_mode=noise_mode)
-
+    
         spectra = Slit(self.specCube, slitWidth=self.Pars.slitWidth).get_spectra(
             slitAngles=self.Pars.slitAngles)
 
@@ -675,20 +705,27 @@ class Image:
         return Image(new_image, new_spaceGrid)
     
     def gen_image_variance(self, signal_to_noise, add_noise=False):
-        gsImg = galsim.Image(np.ascontiguousarray(self.array.copy()), scale=self.pixScale)
+        gsImg = self.gen_galsimImage()
         variance = gsImg.addNoiseSNR(galsim.GaussianNoise(), signal_to_noise, preserve_flux=True)
         if add_noise:  # replace self.array with the noise version
             self.array = gsImg.array
         return variance
+    
+    def gen_galsimImage(self, array=None):
+        '''generate galsim Image object'''
+        if array is None:
+            array = self.array.copy()
+        gsImg = galsim.Image(np.ascontiguousarray(array), scale=self.pixScale, xmin=0, ymin=0)
+        return gsImg
 
     def add_psf(self, psfFWHM, psf_g1, psf_g2):
         psf = galsim.Gaussian(fwhm=psfFWHM)
         psf = psf.shear(g1=psf_g1, g2=psf_g2)
 
-        thisIm = galsim.Image(np.ascontiguousarray(self.array), scale=self.pixScale)
-        galobj = galsim.InterpolatedImage(image=thisIm)
+        gsImg = self.gen_galsimImage()
+        galobj = galsim.InterpolatedImage(image=gsImg)
         galC = galsim.Convolution([galobj, psf])
-        newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale))
+        newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale, xmin=0, ymin=0))
         self.array = newImage.array
     
     def _get_mesh(self, mode='corner'):
@@ -895,10 +932,10 @@ class SpecCube:
         psf = psf.shear(g1=psf_g1, g2=psf_g2)
 
         for k in self.id_LOSwithEmitssion:
-            thisIm = galsim.Image(np.ascontiguousarray(self.array[:,:,k]), scale=self.pixScale)
+            thisIm = galsim.Image(np.ascontiguousarray(self.array[:,:,k]), scale=self.pixScale, xmin=0, ymin=0)
             galobj = galsim.InterpolatedImage(image=thisIm)
             galC = galsim.Convolution([galobj, psf])
-            newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale))
+            newImage = galC.drawImage(image=galsim.Image(self.ngrid, self.ngrid, scale=self.pixScale, xmin=0, ymin=0))
             self.array[:,:,k] = newImage.array
 
     def _kernel_at_k(self, k, sigma2Grid):
