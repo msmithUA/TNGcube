@@ -66,6 +66,8 @@ class ParametersTNG:
         
         self.add_cosmoRedshift()
         self.define_grids()
+        self._photonObsFactor = None
+        self._energy_per_photon = None
 
     def set_defaults(self):
         '''Initiate default parameters'''
@@ -125,6 +127,27 @@ class ParametersTNG:
 
         return int_peakI/energy_per_photon
     
+    @property
+    def photonObsFactor(self):
+        '''The factor related to the total integration of photons during observation.
+            [unit: s*cm2*arcsec2*nm]
+        '''
+        if self._photonObsFactor is None:
+            self._photonObsFactor = self.fid['expTime']*self.fid['area'] * \
+                self.fid['throughput']*self.subGridPixScale**2 * \
+                self.fid['nm_per_pixel']
+        return self._photonObsFactor
+    
+    @property
+    def energy_per_photon(self):
+        '''Energy per photon (at each lambda across the lambdaGrid array) [unit: erg/photon]
+            E = hv = hc/lambda
+        '''
+        if self._energy_per_photon is None:
+            self._energy_per_photon = constants.h*constants.c/(self.lambdaGrid * u.nm) / u.photon
+            self._energy_per_photon = self._energy_per_photon.to(u.erg/u.photon)
+        return self._energy_per_photon
+        
     def define_grids(self):
 
         # grid parameters
@@ -432,38 +455,63 @@ class TNGmock:
             imageArr = Image(self.specCube0).array
         return imageArr
         
-    def mass_to_light(self, massCube, MLratio=4.e-6):
-        '''turn the unit of massCube (Msun/h /pix^3) to photonCube wiht unit Nphotons/pix^3.
+    def mass_to_light(self, massCube, MLratio=1.e-3):
+        '''turn the unit of massCube (Msun/h /pix^3) to photonCube with unit Nphotons/pix^3.
             Args:
                 MLratio: real
                     mass to light ratio
             
             Note:
-                Currently simply set the default MLratio roughly at 4.e-6 by letting the photonCube have a right order.
-                    np.sum(TF.modelCube) = 56673.481175424145
-                    np.sum(massCube) = 13366719585.1875
-                    MLratio = 56673.481175424145/13366719585.1875 ~ 4.0e-06
+                Currently simply set the default MLratio roughly at 1e-3 by letting the photonCube have a right order.
                 In the future this function can be use to acount for optical transparency. 
         '''
 
-        photonCube = massCube * MLratio
+        photonCube = massCube * MLratio # [unit: erg/s/cm2/nm/arcsec2]
+        photonCube /= self.Pars.energy_per_photon.value[None, None, :] # [unit: Nphs/s/cm2/nm/arcsec2]
+        photonCube *= self.Pars.photonObsFactor # [unit: Nphotons/lambda_pixel/x_pixel/y_pixel]
 
         return photonCube
     
     def gen_photonCube(self, ptlTypes=['gas'], weights='SFR'):
+        '''photonCube [unit: Nphotons/lambda_pixel/1 x_pixel/1 y_pixel]'''
         massCube = self.gen_massCube(ptlTypes=ptlTypes, lineTypes=self.line_species, weights=weights)
-        photonCube = self.mass_to_light(massCube, MLratio=4.e-6)
+        photonCube = self.mass_to_light(massCube, MLratio=1.e-3) 
         return photonCube
         
-    def flux_renorm(self, specCube):
-        '''Perform flux re-normalization for photonCube such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars['ref_SDSS_peakI']*expTime*area
-        '''
-        spec1D = Fiber(specCube).get_spectrum(fiberR=1.5)  # SDSS fiber Radius=1.5 arcsec
-        Nphoton_peak = spec1D.max()*u.photon/u.nm
-        renorm_factor = self.Pars.integrated_peakI/Nphoton_peak
-        specCube.array *= renorm_factor.value
+    def flux_normalization(self, *args):
+        '''Perform flux re-normalization for specCube or Image. 
 
-        return specCube
+            Args: SpecCube or Image Obj.
+
+            Example:
+                >> self.flux_normalization(specCube)
+                    Perform normalization such that the integrated fiber spectrum is consistent with the given SDSS fiber spectrum set in self.Pars['ref_SDSS_peakI'] (SDSS BOSS fiber R = 1.5 arcsec)
+            
+                >> self.flux_normalization(image)
+                    Perform normalization such that within fiber R, tot_flux_in_R/tot_Npixs ~ 1.
+        '''
+
+        fiberR = 1.5
+        
+        if isinstance(args[0], SpecCube):
+            #spec1D = Fiber(specCube).get_spectrum(fiberR=fiberR, expTime=self.Pars.expTime, area=self.Pars.area)   # [unit: erg/Ang/sec/cm^2/fiber]
+            specCube = args[0]
+            spec1D = Fiber(specCube).get_spectrum(fiberR=fiberR)  # [unit: Nphotons/nm/fiber]
+            Nphoton_peak = spec1D.max() 
+            renorm_factor = self.Pars.integrated_peakI/Nphoton_peak
+            specCube.array *= renorm_factor.value
+            return specCube
+        elif isinstance(args[0], Image):
+            image = args[0]
+            Xmesh, Ymesh = image._get_mesh(mode='center')
+            Rmesh = np.sqrt(Xmesh**2+Ymesh**2)
+            ID_in_R = np.where(Rmesh <= fiberR)
+            Npix_in_R = len(ID_in_R[0])
+            avg_flux_in_R = np.sum(image.array[ID_in_R])/Npix_in_R
+            renorm_factor = 1./avg_flux_in_R
+            image.array *= renorm_factor
+        else:
+            raise TypeError('Input arguemnt needs to be a SpecCube obj. or an Image obj.')
     
     def add_sky_noise(self, specCube, sky):
 
@@ -514,6 +562,8 @@ class TNGmock:
         # add psf to image
         self.image.add_psf(psfFWHM=self.Pars.psfFWHM,
                            psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
+        # perform flux normalization
+        self.flux_normalization(self.image)
         
         # compute noise given SNR or add noise to self.image.array
         if noise_mode == 1:
@@ -524,6 +574,7 @@ class TNGmock:
         return self.image
         
     def gen_mock_specCube(self, noise_mode=0):
+        '''generate 3D specCube [unit: Nphotons/lambda_pixel/1 x_pixel/1 y_pixel]'''
 
         # 1. generate specCube
         #photonCube = self.gen_photonCube(ptlTypes=['gas', 'stars'], weights='mass')
@@ -545,7 +596,7 @@ class TNGmock:
         #self.specCube.add_spec_sigma(resolution=self.Pars.Resolution, sigma_thermal_nm=self.sigma_resolution_nm) # smoothing with detailed way
 
         # 4. flux renorm
-        self.specCube = self.flux_renorm(self.specCube)
+        self.specCube = self.flux_normalization(self.specCube)
 
         # 5. compute sky noise
         self.sky = Sky(self.Pars)
@@ -621,8 +672,7 @@ class Sky:
         '''
         spec = np.interp(self.Pars.lambdaGrid, self.skyTemplate['lam']*1000., self.skyTemplate['flux'])
         spec /= 1.0e7  # 1/1000 for micron <-> nm ; 1/10000 for m2 <-> cm2
-        spec *= self.Pars.expTime*self.Pars.area*self.Pars.throughput * \
-            self.Pars.subGridPixScale**2*self.Pars.nm_per_pixel
+        spec *= self.Pars.photonObsFactor
 
         return spec
     
@@ -836,17 +886,17 @@ class Fiber:
 
         mask = self.gen_mask(fiberR)
         maskCube = np.repeat(mask[:, :, np.newaxis], self.specCube.array.shape[2], axis=2)
-        spectrum = np.sum(np.sum(self.specCube.array*maskCube, axis=0), axis=0)
+        spectrum = np.sum(np.sum(self.specCube.array*maskCube, axis=0), axis=0) # [unit: Nphotons/lambda_pixel/fiber]
+        spectrum /= self.specCube.nm_per_pixel # [unit: Nphotons/nm/fiber]
 
         if (expTime is not None) and (area is not None):
             # if both expTime and telescope area information is given, 
             # return spectrum in the default unit of SDSS
-            return Fiber.specPhoton_2_specSDSS(spectrum, expTime, area) # [unit: u.erg/u.Angstrom/u.s/u.cm**2]
+            return self.specPhoton_2_specSDSS(spectrum, expTime, area) # [unit: u.erg/u.Angstrom/u.s/u.cm**2]
         else:
-            return spectrum  # [unit: u.photon/u.nm]
+            return spectrum  # [unit: Nphotons/nm (/fiber)]
     
-    @staticmethod
-    def specPhoton_2_specSDSS(specPhoton, expTime, area):
+    def specPhoton_2_specSDSS(self, specPhoton, expTime, area):
         '''Perform unit transformation for a input spec1D [photons/nm] to the standard SDSS fiber spec unit [erg/Angstrom/s/cm^2], given the expTime, and telecscope area.
 
             Args:
