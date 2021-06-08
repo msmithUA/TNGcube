@@ -124,10 +124,14 @@ class QueryTNG():
                 https://www.tng-project.org/data/docs/specifications/
         '''
 
-        snap = {    'pos': f_hdf5[ptl_type]['Coordinates'][:, :], 
-                    'vel': f_hdf5[ptl_type]['Velocities'][:, :]*np.sqrt(self.a), 
-                        # change the unit of velocity from [sqrt(a) km/s] to [km/s]
-                    'mass': f_hdf5[ptl_type]['Masses'][:]   }
+        try :
+            snap = {    'pos': f_hdf5[ptl_type]['Coordinates'][:, :], 
+                        'vel': f_hdf5[ptl_type]['Velocities'][:, :]*np.sqrt(self.a), 
+                            # change the unit of velocity from [sqrt(a) km/s] to [km/s]
+                        'mass': f_hdf5[ptl_type]['Masses'][:]   }
+        except KeyError:
+            print(f'SubhaloID %s does not have any {ptl_type} particles.' % subhaloInfo['id'])
+            return None
 
         # modify the ptl. position and velocity vectors such that they are w.r.t. the subhalo c.m. and system velocity
         for j in range(3):
