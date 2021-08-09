@@ -301,6 +301,7 @@ class TNGmock:
         if auto_tune:
             imgArr = self.gen_imageArray(weights='line')
             img0 = Image(imgArr, self.Pars.spaceGrid)
+            img0.add_psf(psfFWHM=self.Pars.psfFWHM, psf_g1=self.Pars.psf_g1, psf_g2=self.Pars.psf_g2)
             gsImg = img0.gen_galsimImage()
             self.moments = gsImg.FindAdaptiveMom()
             # fine tune PA
