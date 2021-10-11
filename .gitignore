@@ -2,7 +2,7 @@
 *.pkl
 *.pdf
 *.hdf5
-build
+notebook_build
 scratch_code.py
 
 # Compiled source
